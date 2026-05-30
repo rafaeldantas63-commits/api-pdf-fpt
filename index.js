@@ -7,16 +7,18 @@ app.post('/gerar-pdf', async (req, res) => {
     let browser;
     try {
         browser = await puppeteer.launch({
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, // Força o uso do Chrome correto do Docker
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage', // Comando crucial que libera o limite de memória para as imagens
-                '--disable-gpu'
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--single-process', // Economiza memória
+                '--no-zygote'       // Evita travamentos no boot do navegador
             ]
         });
         const page = await browser.newPage();
         
-        // Alterado de networkidle0 para domcontentloaded para não travar por tempo de espera
         await page.setContent(req.body.html, { waitUntil: 'domcontentloaded', timeout: 60000 });
         
         const pdfBuffer = await page.pdf({
@@ -30,7 +32,7 @@ app.post('/gerar-pdf', async (req, res) => {
         });
         res.json({ pdfBase64: pdfBuffer.toString('base64') });
     } catch (error) {
-        console.error("ERRO GERANDO PDF:", error); // Agora o erro exato aparecerá no Render!
+        console.error("ERRO GERANDO PDF:", error); 
         res.status(500).send(error.toString());
     } finally {
         if (browser) await browser.close();
