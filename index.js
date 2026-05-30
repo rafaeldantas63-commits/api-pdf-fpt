@@ -10,35 +10,28 @@ app.post('/gerar-pdf', async (req, res) => {
         browser = await puppeteer.launch({
             headless: 'new',
             executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
-            args: [
-                '--no-sandbox', 
-                '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--no-zygote'
-            ]
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-zygote']
         });
         const page = await browser.newPage();
-        
         await page.setContent(req.body.html, { waitUntil: 'networkidle0', timeout: 120000 });
         
+        // Variáveis dinâmicas vindas do Power Apps
+        const headerHtml = req.body.cabecalho || '<div></div>';
         const footerHtml = req.body.rodape || '<div></div>';
-        // Aqui a API pega a margem dinâmica que vem do seu Power Automate (ou usa 55mm por segurança)
-        const margemInferior = req.body.margemBottom || '55mm'; 
+        const mTop = req.body.margemTop || '10mm';
+        const mBottom = req.body.margemBottom || '55mm';
 
         const pdfBuffer = await page.pdf({
             format: 'A4',
             printBackground: true,
             displayHeaderFooter: true,
-            headerTemplate: '<div></div>',
+            headerTemplate: headerHtml, // AGORA O CABEÇALHO É DINÂMICO
             footerTemplate: footerHtml,
-            // Aplicando a margem que veio do banco de dados:
-            margin: { top: '10mm', bottom: margemInferior, right: '15mm', left: '15mm' },
+            margin: { top: mTop, bottom: mBottom, right: '15mm', left: '15mm' },
             timeout: 120000
         });
         res.json({ pdfBase64: pdfBuffer.toString('base64') });
     } catch (error) {
-        console.error("ERRO GERANDO PDF:", error); 
         res.status(500).send(error.toString());
     } finally {
         if (browser) await browser.close();
