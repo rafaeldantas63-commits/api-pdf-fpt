@@ -7,20 +7,30 @@ app.post('/gerar-pdf', async (req, res) => {
     let browser;
     try {
         browser = await puppeteer.launch({
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
+            args: [
+                '--no-sandbox', 
+                '--disable-setuid-sandbox', 
+                '--disable-dev-shm-usage', // Comando crucial que libera o limite de memória para as imagens
+                '--disable-gpu'
+            ]
         });
         const page = await browser.newPage();
-        await page.setContent(req.body.html, { waitUntil: 'networkidle0' });
+        
+        // Alterado de networkidle0 para domcontentloaded para não travar por tempo de espera
+        await page.setContent(req.body.html, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        
         const pdfBuffer = await page.pdf({
             format: 'A4',
             printBackground: true,
             displayHeaderFooter: true,
             headerTemplate: '<div></div>',
             footerTemplate: '<div style="font-size:10px; font-family:Arial; width:100%; text-align:right; padding-right:20px;"><span class="pageNumber"></span> / <span class="totalPages"></span></div>',
-            margin: { top: '20px', bottom: '50px', right: '20px', left: '20px' }
+            margin: { top: '20px', bottom: '50px', right: '20px', left: '20px' },
+            timeout: 60000
         });
         res.json({ pdfBase64: pdfBuffer.toString('base64') });
     } catch (error) {
+        console.error("ERRO GERANDO PDF:", error); // Agora o erro exato aparecerá no Render!
         res.status(500).send(error.toString());
     } finally {
         if (browser) await browser.close();
