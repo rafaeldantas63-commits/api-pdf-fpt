@@ -1,24 +1,29 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
 const app = express();
+
+// Limite estendido para suportar o tamanho das suas imagens em Base64
 app.use(express.json({ limit: '50mb' }));
 
 app.post('/gerar-pdf', async (req, res) => {
     let browser;
     try {
         browser = await puppeteer.launch({
-            headless: 'new', // Comando atualizado para evitar o aviso amarelo
+            headless: 'new',
+            // O "GPS" crucial que aponta para o Chrome correto dentro do Docker:
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage', // Mantém o gerenciamento de memória otimizado
-                '--disable-gpu'
+                '--disable-dev-shm-usage', // Essencial: Impede que as imagens estourem a memória
+                '--disable-gpu',
+                '--no-zygote'
             ]
         });
         const page = await browser.newPage();
         
-        // Aumentamos o tempo limite para 120 segundos (120000ms) devido ao tamanho do Base64
-        await page.setContent(req.body.html, { waitUntil: 'domcontentloaded', timeout: 120000 });
+        // 120 segundos (120000ms) para garantir que o Power Automate não cancele por pressa
+        await page.setContent(req.body.html, { waitUntil: 'networkidle0', timeout: 120000 });
         
         const pdfBuffer = await page.pdf({
             format: 'A4',
