@@ -9,25 +9,31 @@ app.post('/gerar-pdf', async (req, res) => {
     try {
         browser = await puppeteer.launch({
             headless: 'new',
-            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, // Usa o navegador seguro do Alpine
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage', // Libera memória para as imagens Base64
-                '--disable-gpu'
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--no-zygote'
             ]
         });
         const page = await browser.newPage();
         
         await page.setContent(req.body.html, { waitUntil: 'networkidle0', timeout: 120000 });
         
+        // Recebe a variável "rodape" do Power Automate. 
+        // Se não tiver, usa vazio.
+        const footerHtml = req.body.rodape || '<div></div>';
+
         const pdfBuffer = await page.pdf({
             format: 'A4',
             printBackground: true,
             displayHeaderFooter: true,
             headerTemplate: '<div></div>',
-            footerTemplate: '<div style="font-size:10px; font-family:Arial; width:100%; text-align:right; padding-right:20px;"><span class="pageNumber"></span> / <span class="totalPages"></span></div>',
-            margin: { top: '20px', bottom: '50px', right: '20px', left: '20px' },
+            footerTemplate: footerHtml,
+            // Margens exatas do seu relatório, com um fundo de 35mm para a tabela caber:
+            margin: { top: '10mm', bottom: '35mm', right: '15mm', left: '15mm' },
             timeout: 120000
         });
         res.json({ pdfBase64: pdfBuffer.toString('base64') });
