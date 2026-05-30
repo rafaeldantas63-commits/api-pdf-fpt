@@ -2,7 +2,6 @@ const express = require('express');
 const puppeteer = require('puppeteer');
 const app = express();
 
-// Limite estendido para suportar o tamanho das suas imagens em Base64
 app.use(express.json({ limit: '50mb' }));
 
 app.post('/gerar-pdf', async (req, res) => {
@@ -10,19 +9,16 @@ app.post('/gerar-pdf', async (req, res) => {
     try {
         browser = await puppeteer.launch({
             headless: 'new',
-            // O "GPS" crucial que aponta para o Chrome correto dentro do Docker:
-            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, // Usa o navegador seguro do Alpine
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage', // Essencial: Impede que as imagens estourem a memória
-                '--disable-gpu',
-                '--no-zygote'
+                '--disable-dev-shm-usage', // Libera memória para as imagens Base64
+                '--disable-gpu'
             ]
         });
         const page = await browser.newPage();
         
-        // 120 segundos (120000ms) para garantir que o Power Automate não cancele por pressa
         await page.setContent(req.body.html, { waitUntil: 'networkidle0', timeout: 120000 });
         
         const pdfBuffer = await page.pdf({
