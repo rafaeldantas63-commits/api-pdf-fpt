@@ -7,19 +7,18 @@ app.post('/gerar-pdf', async (req, res) => {
     let browser;
     try {
         browser = await puppeteer.launch({
-            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, // Força o uso do Chrome correto do Docker
+            headless: 'new', // Comando atualizado para evitar o aviso amarelo
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--single-process', // Economiza memória
-                '--no-zygote'       // Evita travamentos no boot do navegador
+                '--disable-dev-shm-usage', // Mantém o gerenciamento de memória otimizado
+                '--disable-gpu'
             ]
         });
         const page = await browser.newPage();
         
-        await page.setContent(req.body.html, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        // Aumentamos o tempo limite para 120 segundos (120000ms) devido ao tamanho do Base64
+        await page.setContent(req.body.html, { waitUntil: 'domcontentloaded', timeout: 120000 });
         
         const pdfBuffer = await page.pdf({
             format: 'A4',
@@ -28,7 +27,7 @@ app.post('/gerar-pdf', async (req, res) => {
             headerTemplate: '<div></div>',
             footerTemplate: '<div style="font-size:10px; font-family:Arial; width:100%; text-align:right; padding-right:20px;"><span class="pageNumber"></span> / <span class="totalPages"></span></div>',
             margin: { top: '20px', bottom: '50px', right: '20px', left: '20px' },
-            timeout: 60000
+            timeout: 120000
         });
         res.json({ pdfBase64: pdfBuffer.toString('base64') });
     } catch (error) {
