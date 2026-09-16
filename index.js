@@ -1,6 +1,6 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
-const pdfParse = require('pdf-parse'); // Nossa nova inteligência de leitura
+const pdfParse = require('pdf-parse');
 const app = express();
 
 app.use(express.json({ limit: '50mb' }));
@@ -45,7 +45,6 @@ app.post('/gerar-pdf', async (req, res) => {
         // =========================================================================
         // MOTOR DE ÍNDICE INTELIGENTE (TWO-PASS RENDERING)
         // =========================================================================
-        // A API verifica se existe alguma âncora (#ANC_...) enviada pelo Power Apps
         if (htmlContent.includes('#ANC_')) {
             
             // 1º PASSO: Gera PDF Fantasma na memória
@@ -60,22 +59,25 @@ app.post('/gerar-pdf', async (req, res) => {
             const anchors = htmlContent.match(/#ANC_[A-Za-z0-9_]+#/g);
             if (anchors) {
                 [...new Set(anchors)].forEach(anchor => {
-                    // Descobre em qual página a âncora caiu
-                    let pageNum = pages.findIndex(pText => pText.includes(anchor)) + 1;
+                    // LIMPEZA: Remove os espaços da âncora e do texto do PDF lido para o Match ser perfeito
+                    let cleanAnchor = anchor.replace(/\s+/g, '');
+                    let pageNum = pages.findIndex(pText => pText.replace(/\s+/g, '').includes(cleanAnchor)) + 1;
+                    
                     if (pageNum > 0) {
-                        // Troca a variável no Índice (Ex: Troca {{PAG_CAP2_1}} pelo número '5')
                         let placeholder = anchor.replace('#ANC_', '{{PAG_').replace('#', '}}');
-                        htmlContent = htmlContent.replace(new RegExp(placeholder, 'g'), pageNum);
                         
-                        // Apaga a âncora do HTML final para ela não aparecer impressa
-                        htmlContent = htmlContent.replace(new RegExp(anchor, 'g'), '');
+                        // SUBSTITUIÇÃO SEGURA: Usa split e join para não dar erro de Sintaxe com o "{{ }}"
+                        htmlContent = htmlContent.split(placeholder).join(pageNum);
+                        
+                        // Apaga a âncora do HTML final
+                        htmlContent = htmlContent.split(anchor).join('');
                     }
                 });
             }
         }
 
         // =========================================================================
-        // GERAÇÃO DO PDF FINAL (Com números reais do Índice)
+        // GERAÇÃO DO PDF FINAL
         // =========================================================================
         await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 120000 });
         const finalPdfBuffer = await page.pdf(pdfOptions);
