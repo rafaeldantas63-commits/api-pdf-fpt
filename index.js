@@ -20,9 +20,8 @@ function render_page(pageData) {
 
 // =========================================================================
 // HELPER: normaliza texto para busca de ancora
-// Mantem letras, numeros e o "#".
-// O "#" final funciona como DELIMITADOR e elimina a colisao de substring:
-//   "#ANCCAP21#" deixa de casar dentro de "#ANCCAP211#"
+// Mantem letras, numeros e o "#". O "#" final funciona como DELIMITADOR:
+// "#ANCCAP21#" deixa de casar dentro de "#ANCCAP211#"
 // =========================================================================
 function normalizarAncora(texto) {
     return texto.replace(/[^a-zA-Z0-9#]/g, '');
@@ -35,7 +34,6 @@ app.post('/gerar-pdf', async (req, res) => {
     try {
         // -----------------------------------------------------------------
         // VALIDACAO DE ENTRADA
-        // Sem isso, um payload malformado gera TypeError e vira 500 generico.
         // -----------------------------------------------------------------
         if (!req.body || typeof req.body.html !== 'string' || req.body.html.trim() === '') {
             console.error("⚠️ Requisição inválida: campo 'html' ausente ou vazio.");
@@ -46,8 +44,6 @@ app.post('/gerar-pdf', async (req, res) => {
 
         // -----------------------------------------------------------------
         // PARAMETROS (todos com fallback = retrocompatibilidade total)
-        // Se o botao/fluxo ainda nao enviarem os campos novos,
-        // a API continua funcionando exatamente como antes.
         // -----------------------------------------------------------------
         let htmlContent = req.body.html;
         const headerRaw = req.body.cabecalho || '<div></div>';
@@ -55,10 +51,9 @@ app.post('/gerar-pdf', async (req, res) => {
 
         const mTop = req.body.margemTop || '10mm';
         const mBottom = req.body.margemBottom || '55mm';
-        const mLateral = req.body.margemLateral || '15mm';   // NOVO
-        const tamanhoPapel = req.body.tamanhoPapel || 'A4';  // NOVO
+        const mLateral = req.body.margemLateral || '15mm';
+        const tamanhoPapel = req.body.tamanhoPapel || 'A4';
 
-        // PermiteLandscape: aceita booleano, "true"/"false", "Sim"/"Não"
         const permiteLandscapeRaw = req.body.permiteLandscape;
         const permiteLandscape =
             permiteLandscapeRaw === true ||
@@ -69,20 +64,12 @@ app.post('/gerar-pdf', async (req, res) => {
 
         // -----------------------------------------------------------------
         // SUBSTITUICAO DE PLACEHOLDERS NO CABECALHO E RODAPE
-        // O template no SharePoint usa [MARGEM_LATERAL] no padding.
-        // Assim cabecalho, rodape e corpo ficam sempre alinhados.
         // -----------------------------------------------------------------
         const headerHtml = headerRaw.split('[MARGEM_LATERAL]').join(mLateral);
         const footerHtml = footerRaw.split('[MARGEM_LATERAL]').join(mLateral);
 
         // -----------------------------------------------------------------
-        // BLOCO @page GERADO PELA API
-        // Fonte unica da verdade da geometria da pagina.
-        // Os valores sao IDENTICOS aos de pdfOptions, para que ligar
-        // preferCSSPageSize nao altere o layout atual.
-        //
-        // A pagina nomeada "paisagem" so e emitida se o cliente permitir.
-        // Para usar: basta a div do capitulo receber class='pagina-paisagem'
+        // CSS DE PAISAGEM (so emitido se o cliente permitir)
         // -----------------------------------------------------------------
         const cssPaisagem = permiteLandscape
             ? `
@@ -93,11 +80,23 @@ app.post('/gerar-pdf', async (req, res) => {
     .pagina-paisagem { page: paisagem; }
 `
             : `
-    /* Landscape desabilitado para este template (PermiteLandscape = Nao).
-       A classe existe mas nao troca a orientacao. */
+    /* Landscape desabilitado para este template (PermiteLandscape = Nao). */
     .pagina-paisagem { page: auto; }
 `;
 
+        // -----------------------------------------------------------------
+        // BLOCO DE GEOMETRIA + CONTENCAO DE LARGURA
+        //
+        // A CORRECAO PRINCIPAL ESTA AQUI:
+        // O documento inteiro fica dentro de uma unica <table class='wrapper-table'>.
+        // Com table-layout:auto o navegador calcula UMA largura para a tabela
+        // toda, baseada no conteudo MAIS LARGO (ex.: tabela de IPs com 11 colunas).
+        // Essa largura vale para TODAS as linhas -> TODAS as paginas ficam largas
+        // demais e sao cortadas na margem.
+        //
+        // table-layout:fixed obriga a wrapper a respeitar width:100%,
+        // eliminando o efeito domino.
+        // -----------------------------------------------------------------
         const blocoGeometria = `
 <style id="geometria-pagina-api">
     @page {
@@ -105,6 +104,32 @@ app.post('/gerar-pdf', async (req, res) => {
         margin: ${mTop} ${mLateral} ${mBottom} ${mLateral};
     }
 ${cssPaisagem}
+
+    /* --- CONTENCAO DE LARGURA --- */
+
+    html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+    }
+
+    /* A tabela "casca" que envolve o documento inteiro */
+    .wrapper-table {
+        table-layout: fixed !important;
+        width: 100% !important;
+        max-width: 100% !important;
+    }
+
+    /* Nenhuma tabela interna pode ultrapassar a largura util */
+    table {
+        max-width: 100% !important;
+    }
+
+    /* Permite quebrar palavras longas em vez de estourar a celula */
+    th, td {
+        overflow-wrap: break-word;
+        word-wrap: break-word;
+    }
 </style>
 `;
 
@@ -113,8 +138,6 @@ ${cssPaisagem}
 
         // -----------------------------------------------------------------
         // OPCOES DO PUPPETEER
-        // preferCSSPageSize: true faz o Chromium respeitar o @page acima.
-        // E o que habilita a pagina nomeada (landscape) funcionar.
         // -----------------------------------------------------------------
         const pdfOptions = {
             format: tamanhoPapel,
@@ -151,7 +174,7 @@ ${cssPaisagem}
             const pages = pdfData.text.split('\n---PAGE_BREAK---\n');
             console.log(`📄 PDF Fantasma tem ${pages.length - 1} páginas válidas.`);
 
-            // Normaliza as paginas UMA unica vez (evita reprocessar por ancora)
+            // Normaliza as paginas UMA unica vez
             const pagesNormalizadas = pages.map(p => normalizarAncora(p));
 
             // 3o PASSO: troca os placeholders {{PAG_...}} pelo numero real
@@ -162,7 +185,6 @@ ${cssPaisagem}
                 console.log(`🎯 Âncoras detectadas no HTML:`, uniqueAnchors);
 
                 uniqueAnchors.forEach(anchor => {
-                    // Mantem o "#" nas pontas -> delimitador -> sem colisao
                     const pureAnchor = normalizarAncora(anchor);
 
                     const pageNum = pagesNormalizadas.findIndex(pText =>
@@ -184,8 +206,7 @@ ${cssPaisagem}
             }
 
             // -------------------------------------------------------------
-            // FALLBACK: limpa qualquer {{PAG_...}} que tenha sobrado.
-            // Sem isso, uma ancora nao encontrada deixaria texto cru no indice.
+            // FALLBACK: limpa qualquer {{PAG_...}} que tenha sobrado
             // -------------------------------------------------------------
             const orfaos = htmlContent.match(/\{\{PAG_[A-Za-z0-9_]+\}\}/g);
             if (orfaos) {
