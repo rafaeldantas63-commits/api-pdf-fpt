@@ -1,19 +1,21 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
 const pdfParse = require('pdf-parse');
-const { PDFDocument, degrees } = require('pdf-lib');
+const { PDFDocument } = require('pdf-lib');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
 // =========================================================================
-// CONFIGURACAO: quais ancoras devem ter sua pagina final rotacionada.
-// Para adicionar um novo capitulo em paisagem no futuro, basta incluir
-// uma nova linha aqui - nao precisa mexer em mais nada.
+// MARCADORES USADOS PARA IDENTIFICAR BLOCOS EM PAISAGEM.
+// Sao simples comentarios HTML, invisiveis, inseridos pelo Power Apps
+// (btn_Controle_14) ao redor de qualquer capitulo que deva sair como
+// pagina fisica em paisagem. Para adicionar um novo capitulo em
+// paisagem no futuro, basta envolve-lo com os MESMOS marcadores -
+// nao precisa mexer em mais nada aqui.
 // =========================================================================
-const ANCORAS_PARA_ROTACIONAR = {
-    '#ANC_CAP_3_2_11#': 90
-};
+const LANDSCAPE_START = '<!--LANDSCAPE_START-->';
+const LANDSCAPE_END = '<!--LANDSCAPE_END-->';
 
 // =========================================================================
 // HELPER: ensina o pdf-parse a marcar a quebra de paginas
@@ -36,13 +38,27 @@ function normalizarAncora(texto) {
 }
 
 // =========================================================================
-// HELPER: dado um buffer de PDF, retorna um array com o texto normalizado
-// de cada pagina (para busca de ancoras).
+// HELPER: divide o HTML final em segmentos alternados
+// [retrato, paisagem, retrato, paisagem, ..., retrato]
+// usando busca de STRING simples (nao depende de leitura de PDF,
+// portanto e 100% confiavel e imune a qualquer reflow de paginacao).
 // =========================================================================
-async function getPaginasNormalizadas(pdfBuffer) {
-    const pdfData = await pdfParse(pdfBuffer, { pagerender: render_page });
-    const pages = pdfData.text.split('\n---PAGE_BREAK---\n');
-    return pages.map(p => normalizarAncora(p));
+function dividirEmSegmentos(html) {
+    const segmentos = [];
+    let restante = html;
+
+    while (restante.includes(LANDSCAPE_START)) {
+        const [antes, depoisDoInicio] = restante.split(LANDSCAPE_START);
+        segmentos.push({ tipo: 'retrato', html: antes });
+
+        const [conteudoPaisagem, depoisDoFim] = depoisDoInicio.split(LANDSCAPE_END);
+        segmentos.push({ tipo: 'paisagem', html: conteudoPaisagem });
+
+        restante = depoisDoFim;
+    }
+    segmentos.push({ tipo: 'retrato', html: restante });
+
+    return segmentos;
 }
 
 app.post('/gerar-pdf', async (req, res) => {
@@ -81,7 +97,7 @@ app.post('/gerar-pdf', async (req, res) => {
         const footerHtml = footerRaw.split('[MARGEM_LATERAL]').join(mLateral);
 
         // -----------------------------------------------------------------
-        // BLOCO DE GEOMETRIA + CONTENCAO DE LARGURA
+        // BLOCO DE GEOMETRIA + CONTENCAO DE LARGURA (para paginas RETRATO)
         // -----------------------------------------------------------------
         const blocoGeometria = `
 <style id="geometria-pagina-api">
@@ -113,12 +129,8 @@ app.post('/gerar-pdf', async (req, res) => {
 </style>
 `;
 
-        htmlContent = blocoGeometria + htmlContent;
-
-        // -----------------------------------------------------------------
-        // OPCOES DO PUPPETEER
-        // -----------------------------------------------------------------
-        const pdfOptions = {
+        // Opcoes de PDF para paginas em RETRATO (documento principal)
+        const pdfOptionsRetrato = {
             format: tamanhoPapel,
             printBackground: true,
             displayHeaderFooter: true,
@@ -126,6 +138,21 @@ app.post('/gerar-pdf', async (req, res) => {
             footerTemplate: footerHtml,
             margin: { top: mTop, bottom: mBottom, right: mLateral, left: mLateral },
             preferCSSPageSize: true,
+            timeout: 120000
+        };
+
+        // Opcoes de PDF para paginas em PAISAGEM (papel fisico deitado).
+        // NAO usa preferCSSPageSize, pois nao injetamos nenhum @page custom
+        // nesse conteudo - deixamos o Puppeteer controlar o tamanho/orientacao
+        // nativamente atraves de "landscape:true", que e o metodo confiavel.
+        const pdfOptionsPaisagem = {
+            format: tamanhoPapel,
+            landscape: true,
+            printBackground: true,
+            displayHeaderFooter: true,
+            headerTemplate: headerHtml,
+            footerTemplate: footerHtml,
+            margin: { top: mTop, bottom: mBottom, right: mLateral, left: mLateral },
             timeout: 120000
         };
 
@@ -139,19 +166,34 @@ app.post('/gerar-pdf', async (req, res) => {
 
         // =================================================================
         // MOTOR DE INDICE INTELIGENTE (TWO-PASS RENDERING)
+        //
+        // Este passo usa um PDF "fantasma" de TODO o documento (incluindo
+        // os marcadores de paisagem, que aqui sao apenas ignorados/tratados
+        // como texto invisivel) apenas para descobrir em que pagina cada
+        // ancora cai, e assim resolver os {{PAG_CAP_X}} do indice.
+        //
+        // NOTA/LIMITACAO CONHECIDA: como o PDF fantasma renderiza tudo em
+        // retrato continuo (sem separar a secao em paisagem fisica), a
+        // contagem de paginas dele pode nao bater 100% com o PDF final
+        // (que tera uma pagina fisica diferente para o trecho em
+        // paisagem). Isso pode gerar uma pequena divergencia no numero
+        // exibido no indice para capitulos MUITO proximos ao trecho em
+        // paisagem - um problema ja identificado e que sera tratado
+        // separadamente, sem relacao com a orientacao da tabela.
         // =================================================================
         if (htmlContent.includes('#ANC_')) {
             console.log("🔍 Âncoras detectadas! Iniciando motor de índice...");
 
-            // 1o PASSO: gera o "PDF Fantasma" apenas na memoria
-            await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 120000 });
-            const ghostPdfBuffer = await page.pdf(pdfOptions);
+            await page.setContent(blocoGeometria + htmlContent, { waitUntil: 'networkidle0', timeout: 120000 });
+            const ghostPdfBuffer = await page.pdf(pdfOptionsRetrato);
             console.log("👻 PDF Fantasma gerado.");
 
-            const pagesNormalizadas = await getPaginasNormalizadas(ghostPdfBuffer);
-            console.log(`📄 PDF Fantasma tem ${pagesNormalizadas.length - 1} páginas válidas.`);
+            const pdfData = await pdfParse(ghostPdfBuffer, { pagerender: render_page });
+            const pages = pdfData.text.split('\n---PAGE_BREAK---\n');
+            console.log(`📄 PDF Fantasma tem ${pages.length - 1} páginas válidas.`);
 
-            // 3o PASSO: troca os placeholders {{PAG_...}} pelo numero real
+            const pagesNormalizadas = pages.map(p => normalizarAncora(p));
+
             const anchors = htmlContent.match(/#ANC_[A-Za-z0-9_]+#/g);
 
             if (anchors) {
@@ -168,33 +210,16 @@ app.post('/gerar-pdf', async (req, res) => {
                     const placeholder = anchor.replace('#ANC_', '{{PAG_').replace('#', '}}');
 
                     if (pageNum > 0) {
-                        console.log(`✅ Âncora ${anchor} -> Página ${pageNum} (estimativa via PDF fantasma)`);
+                        console.log(`✅ Âncora ${anchor} -> Página ${pageNum}`);
                         htmlContent = htmlContent.split(placeholder).join(pageNum);
                     } else {
                         console.log(`❌ Âncora ${anchor} não encontrada. Placeholder será limpo.`);
                     }
 
-                    // -----------------------------------------------------
-                    // IMPORTANTE: as ancoras marcadas para ROTACAO NAO sao
-                    // removidas agora. Elas precisam sobreviver ate o PDF
-                    // FINAL, para que possamos reconferir a pagina real
-                    // depois (o PDF fantasma pode ter uma paginacao
-                    // ligeiramente diferente do PDF final, por causa da
-                    // diferenca de largura entre o placeholder longo e o
-                    // numero curto no indice - isso pode deslocar a
-                    // contagem de TODAS as paginas seguintes).
-                    // Como a ancora e invisivel (opacity:0.02), mante-la
-                    // nao tem nenhum efeito visual no PDF.
-                    // -----------------------------------------------------
-                    if (!ANCORAS_PARA_ROTACIONAR.hasOwnProperty(anchor)) {
-                        htmlContent = htmlContent.split(anchor).join('');
-                    }
+                    htmlContent = htmlContent.split(anchor).join('');
                 });
             }
 
-            // -------------------------------------------------------------
-            // FALLBACK: limpa qualquer {{PAG_...}} que tenha sobrado
-            // -------------------------------------------------------------
             const orfaos = htmlContent.match(/\{\{PAG_[A-Za-z0-9_]+\}\}/g);
             if (orfaos) {
                 const orfaosUnicos = [...new Set(orfaos)];
@@ -210,72 +235,70 @@ app.post('/gerar-pdf', async (req, res) => {
 
         // =================================================================
         // IMPRESSAO FINAL
-        // =================================================================
-        console.log("🖨️ Imprimindo PDF Final...");
-        await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 120000 });
-        let finalPdfBuffer = await page.pdf(pdfOptions);
-
-        // =================================================================
-        // ROTACAO NATIVA DE PAGINAS (via pdf-lib) - COM RECONFERENCIA REAL
         //
-        // Em vez de confiar no numero de pagina calculado no PDF FANTASMA
-        // (que pode estar deslocado por causa do reflow do indice), a API
-        // agora RE-ABRE o PDF FINAL ja gerado e procura a ancora ali dentro,
-        // descobrindo a pagina REAL onde o capitulo caiu de verdade.
-        // Isso elimina qualquer erro de deslocamento entre as duas passagens.
+        // Se NAO houver marcador de paisagem, gera um unico PDF (caminho
+        // simples, igual ao de sempre). Se houver, divide o HTML em
+        // segmentos e renderiza CADA UM com a orientacao correta, depois
+        // junta tudo em um unico PDF final usando pdf-lib.
         // =================================================================
-        const chavesRotacao = Object.keys(ANCORAS_PARA_ROTACIONAR);
-        const rotacoesEncontradas = {};
+        let finalPdfBuffer;
 
-        if (chavesRotacao.length > 0) {
-            console.log("🔎 Reconferindo página real das âncoras de rotação no PDF final...");
-            const paginasFinaisNormalizadas = await getPaginasNormalizadas(finalPdfBuffer);
+        if (!htmlContent.includes(LANDSCAPE_START)) {
+            console.log("🖨️ Imprimindo PDF Final (documento único, sem seções em paisagem)...");
+            await page.setContent(blocoGeometria + htmlContent, { waitUntil: 'networkidle0', timeout: 120000 });
+            finalPdfBuffer = await page.pdf(pdfOptionsRetrato);
 
-            chavesRotacao.forEach(anchor => {
-                const pureAnchor = normalizarAncora(anchor);
-                const paginaReal = paginasFinaisNormalizadas.findIndex(pText =>
-                    pText.includes(pureAnchor)
-                ) + 1;
+        } else {
+            console.log("🖨️ Documento contém seção(ões) em paisagem. Renderizando em partes separadas...");
+            const segmentos = dividirEmSegmentos(htmlContent);
+            const buffersGerados = [];
 
-                if (paginaReal > 0) {
-                    rotacoesEncontradas[anchor] = paginaReal;
-                    console.log(`✅ Página REAL confirmada para ${anchor}: página ${paginaReal} do PDF final.`);
+            for (let i = 0; i < segmentos.length; i++) {
+                const seg = segmentos[i];
+
+                if (seg.tipo === 'retrato') {
+                    // Segmentos retrato vazios (ex.: quando a secao em
+                    // paisagem esta logo no inicio ou no final) sao pulados.
+                    if (seg.html.trim() === '') continue;
+
+                    console.log(`   📄 Renderizando segmento ${i + 1}/${segmentos.length} (retrato)...`);
+                    await page.setContent(blocoGeometria + seg.html, { waitUntil: 'networkidle0', timeout: 120000 });
+                    const buf = await page.pdf(pdfOptionsRetrato);
+                    buffersGerados.push(buf);
+
                 } else {
-                    console.log(`⚠️ Âncora ${anchor} não encontrada no PDF final. Rotação não será aplicada.`);
+                    // Segmento em PAISAGEM: monta um documento HTML minimo e
+                    // independente, sem a geometria de retrato, e renderiza
+                    // com landscape:true (pagina fisica deitada de verdade).
+                    console.log(`   📄 Renderizando segmento ${i + 1}/${segmentos.length} (PAISAGEM)...`);
+                    const docPaisagem = `<!DOCTYPE html><html><head><meta charset="utf-8">
+                        <style>
+                            html, body { margin: 0; padding: 0; }
+                            table { max-width: 100% !important; }
+                            th, td { overflow-wrap: break-word; word-wrap: break-word; }
+                        </style>
+                        </head><body>${seg.html}</body></html>`;
+
+                    await page.setContent(docPaisagem, { waitUntil: 'networkidle0', timeout: 120000 });
+                    const buf = await page.pdf(pdfOptionsPaisagem);
+                    buffersGerados.push(buf);
                 }
-            });
+            }
 
-            // Remove as ancoras de rotacao do HTML (nao sao mais necessarias,
-            // mas como sao invisiveis, isso e so uma limpeza de cortesia -
-            // nao teria efeito visual mesmo se ficassem).
-            chavesRotacao.forEach(anchor => {
-                htmlContent = htmlContent.split(anchor).join('');
-            });
-        }
+            // -------------------------------------------------------------
+            // MERGE: junta todos os PDFs parciais em um unico documento
+            // final, preservando a orientacao de cada pagina individual.
+            // -------------------------------------------------------------
+            console.log("🔗 Unindo os segmentos em um único PDF final...");
+            const pdfFinal = await PDFDocument.create();
 
-        // Se alguma ancora de rotacao foi encontrada, re-renderiza o PDF
-        // final sem as ancoras (limpeza) e aplica a rotacao nativa.
-        if (Object.keys(rotacoesEncontradas).length > 0) {
-            await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 120000 });
-            finalPdfBuffer = await page.pdf(pdfOptions);
+            for (const buf of buffersGerados) {
+                const src = await PDFDocument.load(buf);
+                const paginasCopiadas = await pdfFinal.copyPages(src, src.getPageIndices());
+                paginasCopiadas.forEach(p => pdfFinal.addPage(p));
+            }
 
-            console.log("🔄 Aplicando rotação nativa de página via pdf-lib...");
-            const pdfDoc = await PDFDocument.load(finalPdfBuffer);
-            const pdfPages = pdfDoc.getPages();
-
-            Object.keys(rotacoesEncontradas).forEach(anchor => {
-                const numeroPagina = rotacoesEncontradas[anchor];
-                const graus = ANCORAS_PARA_ROTACIONAR[anchor];
-
-                if (numeroPagina > 0 && numeroPagina <= pdfPages.length) {
-                    pdfPages[numeroPagina - 1].setRotation(degrees(graus));
-                    console.log(`✅ Página ${numeroPagina} rotacionada em ${graus}°.`);
-                } else {
-                    console.log(`⚠️ Não foi possível rotacionar: página ${numeroPagina} fora do intervalo (total: ${pdfPages.length}).`);
-                }
-            });
-
-            finalPdfBuffer = Buffer.from(await pdfDoc.save());
+            finalPdfBuffer = Buffer.from(await pdfFinal.save());
         }
 
         console.log("🎉 PDF Finalizado e enviado ao Power Automate!");
