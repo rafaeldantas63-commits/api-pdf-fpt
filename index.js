@@ -54,11 +54,17 @@ app.post('/gerar-pdf', async (req, res) => {
         const mLateral = req.body.margemLateral || '15mm';
         const tamanhoPapel = req.body.tamanhoPapel || 'A4';
 
-        const permiteLandscapeRaw = req.body.permiteLandscape;
-        const permiteLandscape =
-            permiteLandscapeRaw === true ||
-            String(permiteLandscapeRaw).toLowerCase() === 'true' ||
-            String(permiteLandscapeRaw).toLowerCase() === 'sim';
+    // Fallback = true enquanto o botao/Fluxo nao enviarem o parametro.
+    // Quando o campo PermiteLandscape do SharePoint chegar ate aqui;
+    // ele passa a mandar (basta enviar "Nao" para desligar).
+    const permiteLandscapeRaw = req.body.permiteLandscape;
+    const permiteLandscape =
+        permiteLandscapeRaw === undefined ||
+        permiteLandscapeRaw === null ||
+        permiteLandscapeRaw === '' ||
+        permiteLandscapeRaw === true ||
+        String(permiteLandscapeRaw).toLowerCase() === 'true' ||
+        String(permiteLandscapeRaw).toLowerCase() === 'sim';
 
         console.log(`⚙️ Config: papel=${tamanhoPapel} | top=${mTop} | bottom=${mBottom} | lateral=${mLateral} | landscape=${permiteLandscape}`);
 
