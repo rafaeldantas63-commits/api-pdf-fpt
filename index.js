@@ -7,8 +7,7 @@ const app = express();
 app.use(express.json({ limit: '50mb' }));
 
 // =========================================================================
-// CONFIGURACAO: quais ancoras devem ter sua pagina final rotacionada
-// no PDF (rotacao nativa via pdf-lib, aplicada DEPOIS de gerado o PDF).
+// CONFIGURACAO: quais ancoras devem ter sua pagina final rotacionada.
 // Para adicionar um novo capitulo em paisagem no futuro, basta incluir
 // uma nova linha aqui - nao precisa mexer em mais nada.
 // =========================================================================
@@ -31,11 +30,19 @@ function render_page(pageData) {
 
 // =========================================================================
 // HELPER: normaliza texto para busca de ancora
-// Mantem letras, numeros e o "#". O "#" final funciona como DELIMITADOR:
-// "#ANCCAP21#" deixa de casar dentro de "#ANCCAP211#"
 // =========================================================================
 function normalizarAncora(texto) {
     return texto.replace(/[^a-zA-Z0-9#]/g, '');
+}
+
+// =========================================================================
+// HELPER: dado um buffer de PDF, retorna um array com o texto normalizado
+// de cada pagina (para busca de ancoras).
+// =========================================================================
+async function getPaginasNormalizadas(pdfBuffer) {
+    const pdfData = await pdfParse(pdfBuffer, { pagerender: render_page });
+    const pages = pdfData.text.split('\n---PAGE_BREAK---\n');
+    return pages.map(p => normalizarAncora(p));
 }
 
 app.post('/gerar-pdf', async (req, res) => {
@@ -75,18 +82,6 @@ app.post('/gerar-pdf', async (req, res) => {
 
         // -----------------------------------------------------------------
         // BLOCO DE GEOMETRIA + CONTENCAO DE LARGURA
-        //
-        // A CORRECAO PRINCIPAL ESTA AQUI:
-        // O documento inteiro fica dentro de uma unica <table class='wrapper-table'>.
-        // Com table-layout:auto o navegador calcula UMA largura para a tabela
-        // toda, baseada no conteudo MAIS LARGO. Essa largura vale para TODAS
-        // as linhas -> TODAS as paginas ficam largas demais e sao cortadas.
-        //
-        // table-layout:fixed obriga a wrapper a respeitar width:100%,
-        // eliminando o efeito domino.
-        //
-        // NAO HA MAIS CSS DE PAISAGEM AQUI - a rotacao do 3.2.11 agora e
-        // feita de forma nativa no PDF final via pdf-lib (ver mais abaixo).
         // -----------------------------------------------------------------
         const blocoGeometria = `
 <style id="geometria-pagina-api">
@@ -118,7 +113,6 @@ app.post('/gerar-pdf', async (req, res) => {
 </style>
 `;
 
-        // Injeta a geometria no INICIO do HTML, antes de qualquer outro estilo.
         htmlContent = blocoGeometria + htmlContent;
 
         // -----------------------------------------------------------------
@@ -143,9 +137,6 @@ app.post('/gerar-pdf', async (req, res) => {
 
         const page = await browser.newPage();
 
-        // Guarda o numero de pagina de cada ancora marcada para rotacao
-        const paginasParaRotacionar = {}; // { anchorString: numeroDaPagina, ... }
-
         // =================================================================
         // MOTOR DE INDICE INTELIGENTE (TWO-PASS RENDERING)
         // =================================================================
@@ -157,13 +148,8 @@ app.post('/gerar-pdf', async (req, res) => {
             const ghostPdfBuffer = await page.pdf(pdfOptions);
             console.log("👻 PDF Fantasma gerado.");
 
-            // 2o PASSO: le o texto pagina a pagina
-            const pdfData = await pdfParse(ghostPdfBuffer, { pagerender: render_page });
-            const pages = pdfData.text.split('\n---PAGE_BREAK---\n');
-            console.log(`📄 PDF Fantasma tem ${pages.length - 1} páginas válidas.`);
-
-            // Normaliza as paginas UMA unica vez
-            const pagesNormalizadas = pages.map(p => normalizarAncora(p));
+            const pagesNormalizadas = await getPaginasNormalizadas(ghostPdfBuffer);
+            console.log(`📄 PDF Fantasma tem ${pagesNormalizadas.length - 1} páginas válidas.`);
 
             // 3o PASSO: troca os placeholders {{PAG_...}} pelo numero real
             const anchors = htmlContent.match(/#ANC_[A-Za-z0-9_]+#/g);
@@ -182,20 +168,27 @@ app.post('/gerar-pdf', async (req, res) => {
                     const placeholder = anchor.replace('#ANC_', '{{PAG_').replace('#', '}}');
 
                     if (pageNum > 0) {
-                        console.log(`✅ Âncora ${anchor} -> Página ${pageNum}`);
+                        console.log(`✅ Âncora ${anchor} -> Página ${pageNum} (estimativa via PDF fantasma)`);
                         htmlContent = htmlContent.split(placeholder).join(pageNum);
-
-                        // Se esta ancora estiver na lista de rotacao, guarda a pagina
-                        if (ANCORAS_PARA_ROTACIONAR.hasOwnProperty(anchor)) {
-                            paginasParaRotacionar[anchor] = pageNum;
-                            console.log(`🔄 Página ${pageNum} marcada para rotação (${ANCORAS_PARA_ROTACIONAR[anchor]}°) por causa de ${anchor}`);
-                        }
                     } else {
                         console.log(`❌ Âncora ${anchor} não encontrada. Placeholder será limpo.`);
                     }
 
-                    // A ancora invisivel sai do HTML final em qualquer cenario
-                    htmlContent = htmlContent.split(anchor).join('');
+                    // -----------------------------------------------------
+                    // IMPORTANTE: as ancoras marcadas para ROTACAO NAO sao
+                    // removidas agora. Elas precisam sobreviver ate o PDF
+                    // FINAL, para que possamos reconferir a pagina real
+                    // depois (o PDF fantasma pode ter uma paginacao
+                    // ligeiramente diferente do PDF final, por causa da
+                    // diferenca de largura entre o placeholder longo e o
+                    // numero curto no indice - isso pode deslocar a
+                    // contagem de TODAS as paginas seguintes).
+                    // Como a ancora e invisivel (opacity:0.02), mante-la
+                    // nao tem nenhum efeito visual no PDF.
+                    // -----------------------------------------------------
+                    if (!ANCORAS_PARA_ROTACIONAR.hasOwnProperty(anchor)) {
+                        htmlContent = htmlContent.split(anchor).join('');
+                    }
                 });
             }
 
@@ -223,21 +216,55 @@ app.post('/gerar-pdf', async (req, res) => {
         let finalPdfBuffer = await page.pdf(pdfOptions);
 
         // =================================================================
-        // ROTACAO NATIVA DE PAGINAS (via pdf-lib)
+        // ROTACAO NATIVA DE PAGINAS (via pdf-lib) - COM RECONFERENCIA REAL
         //
-        // Aplica a propriedade /Rotate do PDF na(s) pagina(s) marcada(s).
-        // Isso e nativo do formato PDF - qualquer leitor (Adobe, navegador,
-        // impressora) respeita, sem depender de nenhuma matematica de CSS.
-        // A pagina inteira gira (cabecalho, tabela e rodape juntos).
+        // Em vez de confiar no numero de pagina calculado no PDF FANTASMA
+        // (que pode estar deslocado por causa do reflow do indice), a API
+        // agora RE-ABRE o PDF FINAL ja gerado e procura a ancora ali dentro,
+        // descobrindo a pagina REAL onde o capitulo caiu de verdade.
+        // Isso elimina qualquer erro de deslocamento entre as duas passagens.
         // =================================================================
-        const chavesRotacao = Object.keys(paginasParaRotacionar);
+        const chavesRotacao = Object.keys(ANCORAS_PARA_ROTACIONAR);
+        const rotacoesEncontradas = {};
+
         if (chavesRotacao.length > 0) {
+            console.log("🔎 Reconferindo página real das âncoras de rotação no PDF final...");
+            const paginasFinaisNormalizadas = await getPaginasNormalizadas(finalPdfBuffer);
+
+            chavesRotacao.forEach(anchor => {
+                const pureAnchor = normalizarAncora(anchor);
+                const paginaReal = paginasFinaisNormalizadas.findIndex(pText =>
+                    pText.includes(pureAnchor)
+                ) + 1;
+
+                if (paginaReal > 0) {
+                    rotacoesEncontradas[anchor] = paginaReal;
+                    console.log(`✅ Página REAL confirmada para ${anchor}: página ${paginaReal} do PDF final.`);
+                } else {
+                    console.log(`⚠️ Âncora ${anchor} não encontrada no PDF final. Rotação não será aplicada.`);
+                }
+            });
+
+            // Remove as ancoras de rotacao do HTML (nao sao mais necessarias,
+            // mas como sao invisiveis, isso e so uma limpeza de cortesia -
+            // nao teria efeito visual mesmo se ficassem).
+            chavesRotacao.forEach(anchor => {
+                htmlContent = htmlContent.split(anchor).join('');
+            });
+        }
+
+        // Se alguma ancora de rotacao foi encontrada, re-renderiza o PDF
+        // final sem as ancoras (limpeza) e aplica a rotacao nativa.
+        if (Object.keys(rotacoesEncontradas).length > 0) {
+            await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 120000 });
+            finalPdfBuffer = await page.pdf(pdfOptions);
+
             console.log("🔄 Aplicando rotação nativa de página via pdf-lib...");
             const pdfDoc = await PDFDocument.load(finalPdfBuffer);
             const pdfPages = pdfDoc.getPages();
 
-            chavesRotacao.forEach(anchor => {
-                const numeroPagina = paginasParaRotacionar[anchor];
+            Object.keys(rotacoesEncontradas).forEach(anchor => {
+                const numeroPagina = rotacoesEncontradas[anchor];
                 const graus = ANCORAS_PARA_ROTACIONAR[anchor];
 
                 if (numeroPagina > 0 && numeroPagina <= pdfPages.length) {
