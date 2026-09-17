@@ -75,6 +75,18 @@ app.post('/gerar-pdf', async (req, res) => {
 
         // -----------------------------------------------------------------
         // BLOCO DE GEOMETRIA + CONTENCAO DE LARGURA
+        //
+        // A CORRECAO PRINCIPAL ESTA AQUI:
+        // O documento inteiro fica dentro de uma unica <table class='wrapper-table'>.
+        // Com table-layout:auto o navegador calcula UMA largura para a tabela
+        // toda, baseada no conteudo MAIS LARGO. Essa largura vale para TODAS
+        // as linhas -> TODAS as paginas ficam largas demais e sao cortadas.
+        //
+        // table-layout:fixed obriga a wrapper a respeitar width:100%,
+        // eliminando o efeito domino.
+        //
+        // NAO HA MAIS CSS DE PAISAGEM AQUI - a rotacao do 3.2.11 agora e
+        // feita de forma nativa no PDF final via pdf-lib (ver mais abaixo).
         // -----------------------------------------------------------------
         const blocoGeometria = `
 <style id="geometria-pagina-api">
@@ -106,6 +118,7 @@ app.post('/gerar-pdf', async (req, res) => {
 </style>
 `;
 
+        // Injeta a geometria no INICIO do HTML, antes de qualquer outro estilo.
         htmlContent = blocoGeometria + htmlContent;
 
         // -----------------------------------------------------------------
@@ -139,16 +152,20 @@ app.post('/gerar-pdf', async (req, res) => {
         if (htmlContent.includes('#ANC_')) {
             console.log("🔍 Âncoras detectadas! Iniciando motor de índice...");
 
+            // 1o PASSO: gera o "PDF Fantasma" apenas na memoria
             await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 120000 });
             const ghostPdfBuffer = await page.pdf(pdfOptions);
             console.log("👻 PDF Fantasma gerado.");
 
+            // 2o PASSO: le o texto pagina a pagina
             const pdfData = await pdfParse(ghostPdfBuffer, { pagerender: render_page });
             const pages = pdfData.text.split('\n---PAGE_BREAK---\n');
             console.log(`📄 PDF Fantasma tem ${pages.length - 1} páginas válidas.`);
 
+            // Normaliza as paginas UMA unica vez
             const pagesNormalizadas = pages.map(p => normalizarAncora(p));
 
+            // 3o PASSO: troca os placeholders {{PAG_...}} pelo numero real
             const anchors = htmlContent.match(/#ANC_[A-Za-z0-9_]+#/g);
 
             if (anchors) {
@@ -177,10 +194,14 @@ app.post('/gerar-pdf', async (req, res) => {
                         console.log(`❌ Âncora ${anchor} não encontrada. Placeholder será limpo.`);
                     }
 
+                    // A ancora invisivel sai do HTML final em qualquer cenario
                     htmlContent = htmlContent.split(anchor).join('');
                 });
             }
 
+            // -------------------------------------------------------------
+            // FALLBACK: limpa qualquer {{PAG_...}} que tenha sobrado
+            // -------------------------------------------------------------
             const orfaos = htmlContent.match(/\{\{PAG_[A-Za-z0-9_]+\}\}/g);
             if (orfaos) {
                 const orfaosUnicos = [...new Set(orfaos)];
@@ -204,4 +225,42 @@ app.post('/gerar-pdf', async (req, res) => {
         // =================================================================
         // ROTACAO NATIVA DE PAGINAS (via pdf-lib)
         //
-        // Aplica a propriedade /Rotate do PDF na(s) p
+        // Aplica a propriedade /Rotate do PDF na(s) pagina(s) marcada(s).
+        // Isso e nativo do formato PDF - qualquer leitor (Adobe, navegador,
+        // impressora) respeita, sem depender de nenhuma matematica de CSS.
+        // A pagina inteira gira (cabecalho, tabela e rodape juntos).
+        // =================================================================
+        const chavesRotacao = Object.keys(paginasParaRotacionar);
+        if (chavesRotacao.length > 0) {
+            console.log("🔄 Aplicando rotação nativa de página via pdf-lib...");
+            const pdfDoc = await PDFDocument.load(finalPdfBuffer);
+            const pdfPages = pdfDoc.getPages();
+
+            chavesRotacao.forEach(anchor => {
+                const numeroPagina = paginasParaRotacionar[anchor];
+                const graus = ANCORAS_PARA_ROTACIONAR[anchor];
+
+                if (numeroPagina > 0 && numeroPagina <= pdfPages.length) {
+                    pdfPages[numeroPagina - 1].setRotation(degrees(graus));
+                    console.log(`✅ Página ${numeroPagina} rotacionada em ${graus}°.`);
+                } else {
+                    console.log(`⚠️ Não foi possível rotacionar: página ${numeroPagina} fora do intervalo (total: ${pdfPages.length}).`);
+                }
+            });
+
+            finalPdfBuffer = Buffer.from(await pdfDoc.save());
+        }
+
+        console.log("🎉 PDF Finalizado e enviado ao Power Automate!");
+        res.json({ pdfBase64: finalPdfBuffer.toString('base64') });
+
+    } catch (error) {
+        console.error("🚨 Erro Fatal:", error);
+        res.status(500).json({ erro: error.toString() });
+    } finally {
+        if (browser) await browser.close();
+    }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Ativo na porta ${PORT}`));
