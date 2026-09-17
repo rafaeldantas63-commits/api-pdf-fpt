@@ -1,9 +1,20 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
 const pdfParse = require('pdf-parse');
+const { PDFDocument, degrees } = require('pdf-lib');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
+
+// =========================================================================
+// CONFIGURACAO: quais ancoras devem ter sua pagina final rotacionada
+// no PDF (rotacao nativa via pdf-lib, aplicada DEPOIS de gerado o PDF).
+// Para adicionar um novo capitulo em paisagem no futuro, basta incluir
+// uma nova linha aqui - nao precisa mexer em mais nada.
+// =========================================================================
+const ANCORAS_PARA_ROTACIONAR = {
+    '#ANC_CAP_3_2_11#': 90
+};
 
 // =========================================================================
 // HELPER: ensina o pdf-parse a marcar a quebra de paginas
@@ -54,19 +65,7 @@ app.post('/gerar-pdf', async (req, res) => {
         const mLateral = req.body.margemLateral || '15mm';
         const tamanhoPapel = req.body.tamanhoPapel || 'A4';
 
-    // Fallback = true enquanto o botao/Fluxo nao enviarem o parametro.
-    // Quando o campo PermiteLandscape do SharePoint chegar ate aqui;
-    // ele passa a mandar (basta enviar "Nao" para desligar).
-    const permiteLandscapeRaw = req.body.permiteLandscape;
-    const permiteLandscape =
-        permiteLandscapeRaw === undefined ||
-        permiteLandscapeRaw === null ||
-        permiteLandscapeRaw === '' ||
-        permiteLandscapeRaw === true ||
-        String(permiteLandscapeRaw).toLowerCase() === 'true' ||
-        String(permiteLandscapeRaw).toLowerCase() === 'sim';
-
-        console.log(`⚙️ Config: papel=${tamanhoPapel} | top=${mTop} | bottom=${mBottom} | lateral=${mLateral} | landscape=${permiteLandscape}`);
+        console.log(`⚙️ Config: papel=${tamanhoPapel} | top=${mTop} | bottom=${mBottom} | lateral=${mLateral}`);
 
         // -----------------------------------------------------------------
         // SUBSTITUICAO DE PLACEHOLDERS NO CABECALHO E RODAPE
@@ -75,33 +74,7 @@ app.post('/gerar-pdf', async (req, res) => {
         const footerHtml = footerRaw.split('[MARGEM_LATERAL]').join(mLateral);
 
         // -----------------------------------------------------------------
-        // CSS DE PAISAGEM (so emitido se o cliente permitir)
-        // -----------------------------------------------------------------
-        const cssPaisagem = permiteLandscape
-            ? `
-    @page paisagem {
-        size: ${tamanhoPapel} landscape;
-        margin: ${mTop} ${mLateral} ${mBottom} ${mLateral};
-    }
-    .pagina-paisagem { page: paisagem; }
-`
-            : `
-    /* Landscape desabilitado para este template (PermiteLandscape = Nao). */
-    .pagina-paisagem { page: auto; }
-`;
-
-        // -----------------------------------------------------------------
         // BLOCO DE GEOMETRIA + CONTENCAO DE LARGURA
-        //
-        // A CORRECAO PRINCIPAL ESTA AQUI:
-        // O documento inteiro fica dentro de uma unica <table class='wrapper-table'>.
-        // Com table-layout:auto o navegador calcula UMA largura para a tabela
-        // toda, baseada no conteudo MAIS LARGO (ex.: tabela de IPs com 11 colunas).
-        // Essa largura vale para TODAS as linhas -> TODAS as paginas ficam largas
-        // demais e sao cortadas na margem.
-        //
-        // table-layout:fixed obriga a wrapper a respeitar width:100%,
-        // eliminando o efeito domino.
         // -----------------------------------------------------------------
         const blocoGeometria = `
 <style id="geometria-pagina-api">
@@ -109,9 +82,6 @@ app.post('/gerar-pdf', async (req, res) => {
         size: ${tamanhoPapel} portrait;
         margin: ${mTop} ${mLateral} ${mBottom} ${mLateral};
     }
-${cssPaisagem}
-
-    /* --- CONTENCAO DE LARGURA --- */
 
     html, body {
         margin: 0;
@@ -119,19 +89,16 @@ ${cssPaisagem}
         width: 100%;
     }
 
-    /* A tabela "casca" que envolve o documento inteiro */
     .wrapper-table {
         table-layout: fixed !important;
         width: 100% !important;
         max-width: 100% !important;
     }
 
-    /* Nenhuma tabela interna pode ultrapassar a largura util */
     table {
         max-width: 100% !important;
     }
 
-    /* Permite quebrar palavras longas em vez de estourar a celula */
     th, td {
         overflow-wrap: break-word;
         word-wrap: break-word;
@@ -139,7 +106,6 @@ ${cssPaisagem}
 </style>
 `;
 
-        // Injeta a geometria no INICIO do HTML, antes de qualquer outro estilo.
         htmlContent = blocoGeometria + htmlContent;
 
         // -----------------------------------------------------------------
@@ -164,26 +130,25 @@ ${cssPaisagem}
 
         const page = await browser.newPage();
 
+        // Guarda o numero de pagina de cada ancora marcada para rotacao
+        const paginasParaRotacionar = {}; // { anchorString: numeroDaPagina, ... }
+
         // =================================================================
         // MOTOR DE INDICE INTELIGENTE (TWO-PASS RENDERING)
         // =================================================================
         if (htmlContent.includes('#ANC_')) {
             console.log("🔍 Âncoras detectadas! Iniciando motor de índice...");
 
-            // 1o PASSO: gera o "PDF Fantasma" apenas na memoria
             await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 120000 });
             const ghostPdfBuffer = await page.pdf(pdfOptions);
             console.log("👻 PDF Fantasma gerado.");
 
-            // 2o PASSO: le o texto pagina a pagina
             const pdfData = await pdfParse(ghostPdfBuffer, { pagerender: render_page });
             const pages = pdfData.text.split('\n---PAGE_BREAK---\n');
             console.log(`📄 PDF Fantasma tem ${pages.length - 1} páginas válidas.`);
 
-            // Normaliza as paginas UMA unica vez
             const pagesNormalizadas = pages.map(p => normalizarAncora(p));
 
-            // 3o PASSO: troca os placeholders {{PAG_...}} pelo numero real
             const anchors = htmlContent.match(/#ANC_[A-Za-z0-9_]+#/g);
 
             if (anchors) {
@@ -202,18 +167,20 @@ ${cssPaisagem}
                     if (pageNum > 0) {
                         console.log(`✅ Âncora ${anchor} -> Página ${pageNum}`);
                         htmlContent = htmlContent.split(placeholder).join(pageNum);
+
+                        // Se esta ancora estiver na lista de rotacao, guarda a pagina
+                        if (ANCORAS_PARA_ROTACIONAR.hasOwnProperty(anchor)) {
+                            paginasParaRotacionar[anchor] = pageNum;
+                            console.log(`🔄 Página ${pageNum} marcada para rotação (${ANCORAS_PARA_ROTACIONAR[anchor]}°) por causa de ${anchor}`);
+                        }
                     } else {
                         console.log(`❌ Âncora ${anchor} não encontrada. Placeholder será limpo.`);
                     }
 
-                    // A ancora invisivel sai do HTML final em qualquer cenario
                     htmlContent = htmlContent.split(anchor).join('');
                 });
             }
 
-            // -------------------------------------------------------------
-            // FALLBACK: limpa qualquer {{PAG_...}} que tenha sobrado
-            // -------------------------------------------------------------
             const orfaos = htmlContent.match(/\{\{PAG_[A-Za-z0-9_]+\}\}/g);
             if (orfaos) {
                 const orfaosUnicos = [...new Set(orfaos)];
@@ -232,18 +199,9 @@ ${cssPaisagem}
         // =================================================================
         console.log("🖨️ Imprimindo PDF Final...");
         await page.setContent(htmlContent, { waitUntil: 'networkidle0', timeout: 120000 });
-        const finalPdfBuffer = await page.pdf(pdfOptions);
+        let finalPdfBuffer = await page.pdf(pdfOptions);
 
-        console.log("🎉 PDF Finalizado e enviado ao Power Automate!");
-        res.json({ pdfBase64: finalPdfBuffer.toString('base64') });
-
-    } catch (error) {
-        console.error("🚨 Erro Fatal:", error);
-        res.status(500).json({ erro: error.toString() });
-    } finally {
-        if (browser) await browser.close();
-    }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Ativo na porta ${PORT}`));
+        // =================================================================
+        // ROTACAO NATIVA DE PAGINAS (via pdf-lib)
+        //
+        // Aplica a propriedade /Rotate do PDF na(s) p
