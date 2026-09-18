@@ -283,26 +283,25 @@ async function corrigirNumeracaoRodape(pdfBuffer) {
 }
 
 // =========================================================================
-// NOVA FUNCAO: cria os links de navegacao internos do indice DIRETO no
-// PDF final, via pdf-lib.
+// FUNCAO: cria os links de navegacao internos do indice DIRETO no PDF
+// final, via pdf-lib.
 //
 // POR QUE ISSO E NECESSARIO:
 // O <a href='#ancora'> gerado pelo Chromium funciona perfeitamente DENTRO
 // de um unico documento PDF. Mas quando o documento tem secao em paisagem,
-// nos geramos 3 PDFs SEPARADOS e os costuramos com pdf-lib (copyPages).
-// O copyPages copia o CONTEUDO VISUAL corretamente, mas e uma limitacao
-// conhecida da biblioteca que ele NAO recria de forma confiavel os links
-// de navegacao internos (a ligacao entre o texto clicavel e o destino) -
-// por isso a numeracao (que e so texto) ficou perfeita, mas o link se
-// perdia na costura.
+// geramos varios PDFs SEPARADOS e os costuramos com pdf-lib (copyPages).
+// Essa e uma limitacao CONHECIDA e documentada do pdf-lib (ver issues
+// #1609 e #341 do repositorio oficial): links internos ("Dest") ficam
+// orfaos apos copyPages, porque a referencia de destino aponta para uma
+// pagina do documento de ORIGEM, que nao existe mais no documento final.
 //
-// SOLUCAO: durante a substituicao dos placeholders {{PAG_CAP_X}}, inserimos
-// um MARCADOR INVISIVEL exclusivo logo antes de cada numero. Depois que o
-// PDF final ja esta pronto e costurado, reabrimos ele, localizamos a
-// posicao exata (pagina, x, y) de cada marcador, e desenhamos ali um link
-// de navegacao NATIVO do PDF (uma anotacao Link/GoTo), apontando para a
-// pagina de destino que ja sabemos ser correta (a mesma usada na
-// numeracao, ja validada).
+// SOLUCAO: apos a substituicao dos placeholders {{PAG_CAP_X}}, inserimos
+// um MARCADOR (texto normal, com opacity quase-zero - MESMA tecnica ja
+// validada e usada nas ancoras #ANC_CAP_X# do motor de indice) logo antes
+// de cada numero. Depois que o PDF final ja esta pronto, reabrimos ele,
+// localizamos a posicao (pagina, x, y) de cada marcador, e desenhamos ali
+// um link de navegacao NATIVO do PDF, apontando para a pagina de destino
+// ja validada (a mesma usada na numeracao).
 // =========================================================================
 async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
     const ocorrencias = [];
@@ -319,7 +318,8 @@ async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
                         codigo: match[1],
                         pageIndex: paginaAtual,
                         x: item.transform[4],
-                        y: item.transform[5]
+                        y: item.transform[5],
+                        fontHeight: Math.hypot(item.transform[2], item.transform[3]) || 9
                     });
                 }
             });
@@ -328,6 +328,8 @@ async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
     }
 
     await pdfParse(pdfBuffer, { pagerender: custom_render_page });
+
+    console.log('🔎 Marcadores de link encontrados no texto: ' + ocorrencias.length);
 
     if (ocorrencias.length === 0) {
         console.log('⚠️ Nenhum marcador de link encontrado no PDF final. Links não foram criados.');
@@ -338,29 +340,38 @@ async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
     const pages = pdfDoc.getPages();
     const context = pdfDoc.context;
 
-    const LARGURA_LINK = 42; // pt (~15mm) - cobre o numero de 3 digitos com folga
-    const ALTURA_LINK = 12;  // pt
+    // Largura generosa (~20mm) para cobrir com folga o numero de 3 digitos
+    // mais o proprio marcador (que, mesmo com opacity baixa, ocupa espaco
+    // real na linha por usar fonte de tamanho normal).
+    const LARGURA_LINK = 56; // pt
+    const ALTURA_LINK_EXTRA = 4; // pt de folga acima/abaixo
 
     let criados = 0;
 
     ocorrencias.forEach(function (oc) {
         const destPageNum = mapaDestinos[oc.codigo];
-        if (!destPageNum || destPageNum < 1 || destPageNum > pages.length) return;
+        if (!destPageNum || destPageNum < 1 || destPageNum > pages.length) {
+            console.log('⚠️ Marcador ' + oc.codigo + ': destino inválido ou fora do intervalo.');
+            return;
+        }
         if (oc.pageIndex < 0 || oc.pageIndex >= pages.length) return;
 
         const paginaOrigem = pages[oc.pageIndex];
         const paginaDestino = pages[destPageNum - 1];
 
-        const rectArray = context.obj([oc.x, oc.y - 2, oc.x + LARGURA_LINK, oc.y + ALTURA_LINK]);
-        const destArray = context.obj([paginaDestino.ref, PDFName.of('Fit')]);
-        const borderArray = context.obj([0, 0, 0]);
+        const alturaLink = oc.fontHeight + ALTURA_LINK_EXTRA;
 
         const linkDict = context.obj({});
         linkDict.set(PDFName.of('Type'), PDFName.of('Annot'));
         linkDict.set(PDFName.of('Subtype'), PDFName.of('Link'));
-        linkDict.set(PDFName.of('Rect'), rectArray);
-        linkDict.set(PDFName.of('Border'), borderArray);
-        linkDict.set(PDFName.of('Dest'), destArray);
+        linkDict.set(PDFName.of('Rect'), context.obj([
+            oc.x,
+            oc.y - 2,
+            oc.x + LARGURA_LINK,
+            oc.y + alturaLink
+        ]));
+        linkDict.set(PDFName.of('Border'), context.obj([0, 0, 0]));
+        linkDict.set(PDFName.of('Dest'), context.obj([paginaDestino.ref, PDFName.of('Fit')]));
 
         const linkRef = context.register(linkDict);
 
@@ -378,9 +389,11 @@ async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
         }
         annotsArray.push(linkRef);
         criados++;
+
+        console.log('🔗 Link criado: ' + oc.codigo + ' (página origem ' + (oc.pageIndex + 1) + ') -> página destino ' + destPageNum);
     });
 
-    console.log('🔗 ' + criados + ' link(s) de navegação criado(s) no índice.');
+    console.log('🔗 Total: ' + criados + ' link(s) de navegação criado(s) no índice.');
 
     return Buffer.from(await pdfDoc.save());
 }
@@ -501,9 +514,21 @@ app.post('/gerar-pdf', async (req, res) => {
                         const pageNumFormatado = String(pageNum).padStart(3, '0');
                         console.log('✅ Âncora ' + anchor + ' -> Página ' + pageNum + ' (exibido como "' + pageNumFormatado + '")');
 
+                        // -----------------------------------------------------
                         // Marcador invisivel + numero formatado.
+                        //
+                        // IMPORTANTE: o marcador usa FONTE NORMAL (9pt, igual ao
+                        // texto ao redor) com opacity quase-zero - EXATAMENTE a
+                        // mesma tecnica ja validada e usada com sucesso em toda
+                        // a aplicacao para as ancoras #ANC_CAP_X# do motor de
+                        // indice. Evitamos usar fontes extremamente pequenas
+                        // (ex.: 1px), pois estas podem ser extraidas com
+                        // posicao/dimensao imprecisa pela biblioteca de leitura
+                        // de texto - hipotese mais provavel para o link nao
+                        // funcionar na tentativa anterior.
+                        // -----------------------------------------------------
                         const marcador = '@@LNK_' + codigo + '@@';
-                        const marcadorHtml = '<span style="font-size:1px;color:#ffffff;">' + marcador + '</span>';
+                        const marcadorHtml = '<span style="opacity:0.02;font-size:9pt;color:#000000;">' + marcador + '</span>';
 
                         htmlContent = htmlContent.split(placeholder).join(marcadorHtml + pageNumFormatado);
                         mapaDestinos[codigo] = pageNum;
