@@ -13,13 +13,11 @@ const LANDSCAPE_START = '<!--LANDSCAPE_START-->';
 const LANDSCAPE_END = '<!--LANDSCAPE_END-->';
 
 // =========================================================================
-// MARCADORES DE LOGO (novo)
+// MARCADORES DE LOGO
 //
 // O Power Apps entrega apenas o Base64 CRU envolvido nesses marcadores.
 // E a API quem decide: como montar a tag <img>, qual tamanho usar, e
-// onde posicionar o cabecalho na pagina em paisagem. Isso elimina os
-// varios bugs de truncamento que ocorriam ao montar a tag <img> dentro
-// de formulas complexas do Power Apps.
+// onde posicionar o cabecalho na pagina em paisagem.
 // =========================================================================
 const LOGO_ESQ_START = '<!--LOGO_ESQ-->';
 const LOGO_ESQ_END = '<!--/LOGO_ESQ-->';
@@ -55,10 +53,14 @@ function dividirEmSegmentos(html) {
     let restante = html;
 
     while (restante.includes(LANDSCAPE_START)) {
-        const [antes, depoisDoInicio] = restante.split(LANDSCAPE_START);
+        const partesInicio = restante.split(LANDSCAPE_START);
+        const antes = partesInicio[0];
+        const depoisDoInicio = partesInicio[1];
         segmentos.push({ tipo: 'retrato', html: antes });
 
-        const [conteudoPaisagem, depoisDoFim] = depoisDoInicio.split(LANDSCAPE_END);
+        const partesFim = depoisDoInicio.split(LANDSCAPE_END);
+        const conteudoPaisagem = partesFim[0];
+        const depoisDoFim = partesFim[1];
         segmentos.push({ tipo: 'paisagem', html: conteudoPaisagem });
 
         restante = depoisDoFim;
@@ -69,32 +71,35 @@ function dividirEmSegmentos(html) {
 }
 
 // =========================================================================
-// HELPER (NOVO): extrai o conteudo entre dois marcadores e retorna o
-// texto SEM os marcadores, junto com o texto original SEM aquele trecho.
+// HELPER: extrai o conteudo entre dois marcadores e retorna o texto SEM
+// os marcadores, junto com o texto original SEM aquele trecho.
 // =========================================================================
 function extrairEntreMarcadores(html, marcadorInicio, marcadorFim) {
     if (!html.includes(marcadorInicio)) {
         return { conteudo: '', htmlRestante: html };
     }
-    const [antes, resto] = html.split(marcadorInicio);
-    const [conteudo, depois] = resto.split(marcadorFim);
+    const partesA = html.split(marcadorInicio);
+    const antes = partesA[0];
+    const resto = partesA[1];
+    const partesB = resto.split(marcadorFim);
+    const conteudo = partesB[0];
+    const depois = partesB[1];
     return { conteudo: conteudo.trim(), htmlRestante: antes + depois };
 }
 
 // =========================================================================
-// FUNCAO NOVA: injeta o cabecalho (logos) no topo de um segmento em
-// paisagem.
+// FUNCAO: injeta o cabecalho (logos) no topo de um segmento em paisagem.
 //
-// A API e quem decide TUDO sobre o cabecalho:
+// A API decide TUDO sobre o cabecalho:
 // - a tag <img> e montada aqui, nao no Power Apps
-// - o tamanho (height='45') e definido aqui, igual ao padrao usado em
+// - o tamanho (height=45) e definido aqui, igual ao padrao usado em
 //   todas as demais paginas do relatorio
-// - o logo do cliente so aparece se houver Base64 de fato (nao mostra
-//   icone de imagem quebrada quando o campo esta vazio)
+// - o logo do cliente so aparece se houver Base64 de fato
 // - a posicao (tabela no topo, com borda inferior azul) e definida aqui
 //
-// O Power Apps so precisa fornecer os dois Base64 crus, envolvidos nos
-// marcadores <!--LOGO_ESQ--> e <!--LOGO_DIR-->.
+// REESCRITA SEM TEMPLATE LITERALS MULTILINHA (sem crase com quebra de
+// linha dentro). Usa apenas concatenacao simples com "+", para evitar
+// que duas linhas se fundam acidentalmente durante copia/cola.
 // =========================================================================
 function injetarCabecalhoPaisagem(htmlSegmento) {
     let html = htmlSegmento;
@@ -108,43 +113,49 @@ function injetarCabecalhoPaisagem(htmlSegmento) {
     const base64Esq = logoEsq.conteudo;
     const base64Dir = logoDir.conteudo;
 
-    // Se nenhum logo foi fornecido, nao adiciona cabecalho nenhum.
     if (!base64Esq && !base64Dir) {
         return html;
     }
 
-    const imgEsq = base64Esq
-        ? `<img src="${base64Esq}" '';
+    let imgEsq = '';
+    if (base64Esq) {
+        imgEsq = '<img src="' + base64Esq + '" height="45" />';
+    }
 
-    const imgDir = base64Dir
-        ? `<img src="${base64Dir}" height="45"nst cabecalhoHtml = `
-        <table width="100%" cellspacing="0" cellpadding="0" style="border:none;border-bottom:2px solid #003366;margin-bottom:15px;padding-bottom:10px;">
-            <tr>
-                <td align="left" style="border:none;padding:0;vertical-align:middle;">${imgEsq}</td>
-                <td align="right" style="border:none;padding:0;vertical-align:middle;">${imgDir}</td>
-            </tr>
-        </table>
-    `;
+    let imgDir = '';
+    if (base64Dir) {
+        imgDir = '<img src="' + base64Dir + '" height="45" />';
+    }
+
+    let cabecalhoHtml = '';
+    cabecalhoHtml += '<table width="100%" cellspacing="0" cellpadding="0" ';
+    cabecalhoHtml += 'style="border:none;border-bottom:2px solid #003366;margin-bottom:15px;padding-bottom:10px;">';
+    cabecalhoHtml += '<tr>';
+    cabecalhoHtml += '<td align="left" style="border:none;padding:0;vertical-align:middle;">' + imgEsq + '</td>';
+    cabecalhoHtml += '<td align="right" style="border:none;padding:0;vertical-align:middle;">' + imgDir + '</td>';
+    cabecalhoHtml += '</tr>';
+    cabecalhoHtml += '</table>';
 
     return cabecalhoHtml + html;
 }
 
 // =========================================================================
 // CORRECAO DA NUMERACAO GLOBAL "FOLHA: X de Y"
-// (mantida igual a versao anterior)
 // =========================================================================
 async function corrigirNumeracaoRodape(pdfBuffer) {
     const pagesItems = [];
 
     function custom_render_page(pageData) {
         return pageData.getTextContent().then(function (textContent) {
-            const items = textContent.items.map(item => ({
-                str: item.str,
-                x: item.transform[4],
-                y: item.transform[5],
-                width: item.width,
-                fontHeight: Math.hypot(item.transform[2], item.transform[3]) || 8.5
-            }));
+            const items = textContent.items.map(function (item) {
+                return {
+                    str: item.str,
+                    x: item.transform[4],
+                    y: item.transform[5],
+                    width: item.width,
+                    fontHeight: Math.hypot(item.transform[2], item.transform[3]) || 8.5
+                };
+            });
             pagesItems.push(items);
             return '';
         });
@@ -159,23 +170,25 @@ async function corrigirNumeracaoRodape(pdfBuffer) {
     for (let i = 0; i < pagesItems.length; i++) {
         const items = pagesItems[i];
 
-        const idxMarcador = items.findIndex(it => /FOLHA\s*:?/i.test(it.str));
+        const idxMarcador = items.findIndex(function (it) {
+            return /FOLHA\s*:?/i.test(it.str);
+        });
         if (idxMarcador === -1) {
-            console.log(`⚠️ Página ${i + 1}: marcador "FOLHA" não encontrado, numeração não corrigida nesta página.`);
+            console.log('⚠️ Página ' + (i + 1) + ': marcador "FOLHA" não encontrado, numeração não corrigida nesta página.');
             continue;
         }
 
         const baseY = items[idxMarcador].y;
         const baseX = items[idxMarcador].x;
 
-        const itensDaLinha = items.filter(it =>
-            Math.abs(it.y - baseY) < 2 && it.x >= baseX - 2
-        );
+        const itensDaLinha = items.filter(function (it) {
+            return Math.abs(it.y - baseY) < 2 && it.x >= baseX - 2;
+        });
 
         if (itensDaLinha.length === 0) continue;
 
-        const minX = Math.min(...itensDaLinha.map(it => it.x));
-        const maxX = Math.max(...itensDaLinha.map(it => it.x + it.width));
+        const minX = Math.min.apply(null, itensDaLinha.map(function (it) { return it.x; }));
+        const maxX = Math.max.apply(null, itensDaLinha.map(function (it) { return it.x + it.width; }));
         const fontSize = items[idxMarcador].fontHeight;
         const alturaCaixa = fontSize * 1.5;
         const yCaixa = baseY - alturaCaixa * 0.3;
@@ -190,7 +203,7 @@ async function corrigirNumeracaoRodape(pdfBuffer) {
             color: rgb(1, 1, 1)
         });
 
-        pagina.drawText(`FOLHA: ${i + 1} de ${totalPaginas}`, {
+        pagina.drawText('FOLHA: ' + (i + 1) + ' de ' + totalPaginas, {
             x: minX,
             y: baseY,
             size: fontSize,
@@ -198,7 +211,7 @@ async function corrigirNumeracaoRodape(pdfBuffer) {
             color: rgb(0, 0, 0)
         });
 
-        console.log(`✅ Página ${i + 1}: numeração corrigida para "FOLHA: ${i + 1} de ${totalPaginas}".`);
+        console.log('✅ Página ' + (i + 1) + ': numeração corrigida para "FOLHA: ' + (i + 1) + ' de ' + totalPaginas + '".');
     }
 
     return Buffer.from(await pdfDoc.save());
@@ -231,7 +244,7 @@ app.post('/gerar-pdf', async (req, res) => {
         const mLateral = req.body.margemLateral || '15mm';
         const tamanhoPapel = req.body.tamanhoPapel || 'A4';
 
-        console.log(`⚙️ Config: papel=${tamanhoPapel} | top=${mTop} | bottom=${mBottom} | lateral=${mLateral}`);
+        console.log('⚙️ Config: papel=' + tamanhoPapel + ' | top=' + mTop + ' | bottom=' + mBottom + ' | lateral=' + mLateral);
 
         // -----------------------------------------------------------------
         // SUBSTITUICAO DE PLACEHOLDERS NO CABECALHO E RODAPE
@@ -242,35 +255,14 @@ app.post('/gerar-pdf', async (req, res) => {
         // -----------------------------------------------------------------
         // BLOCO DE GEOMETRIA + CONTENCAO DE LARGURA (para paginas RETRATO)
         // -----------------------------------------------------------------
-        const blocoGeometria = `
-<style id="geometria-pagina-api">
-    @page {
-        size: ${tamanhoPapel} portrait;
-        margin: ${mTop} ${mLateral} ${mBottom} ${mLateral};
-    }
-
-    html, body {
-        margin: 0;
-        padding: 0;
-        width: 100%;
-    }
-
-    .wrapper-table {
-        table-layout: fixed !important;
-        width: 100% !important;
-        max-width: 100% !important;
-    }
-
-    table {
-        max-width: 100% !important;
-    }
-
-    th, td {
-        overflow-wrap: break-word;
-        word-wrap: break-word;
-    }
-</style>
-`;
+        let blocoGeometria = '';
+        blocoGeometria += '<style id="geometria-pagina-api">';
+        blocoGeometria += '@page { size: ' + tamanhoPapel + ' portrait; margin: ' + mTop + ' ' + mLateral + ' ' + mBottom + ' ' + mLateral + '; }';
+        blocoGeometria += 'html, body { margin: 0; padding: 0; width: 100%; }';
+        blocoGeometria += '.wrapper-table { table-layout: fixed !important; width: 100% !important; max-width: 100% !important; }';
+        blocoGeometria += 'table { max-width: 100% !important; }';
+        blocoGeometria += 'th, td { overflow-wrap: break-word; word-wrap: break-word; }';
+        blocoGeometria += '</style>';
 
         const pdfOptionsRetrato = {
             format: tamanhoPapel,
@@ -314,30 +306,30 @@ app.post('/gerar-pdf', async (req, res) => {
 
             const pdfData = await pdfParse(ghostPdfBuffer, { pagerender: render_page });
             const pages = pdfData.text.split('\n---PAGE_BREAK---\n');
-            console.log(`📄 PDF Fantasma tem ${pages.length - 1} páginas válidas.`);
+            console.log('📄 PDF Fantasma tem ' + (pages.length - 1) + ' páginas válidas.');
 
-            const pagesNormalizadas = pages.map(p => normalizarAncora(p));
+            const pagesNormalizadas = pages.map(function (p) { return normalizarAncora(p); });
 
             const anchors = htmlContent.match(/#ANC_[A-Za-z0-9_]+#/g);
 
             if (anchors) {
                 const uniqueAnchors = [...new Set(anchors)];
-                console.log(`🎯 Âncoras detectadas no HTML:`, uniqueAnchors);
+                console.log('🎯 Âncoras detectadas no HTML:', uniqueAnchors);
 
-                uniqueAnchors.forEach(anchor => {
+                uniqueAnchors.forEach(function (anchor) {
                     const pureAnchor = normalizarAncora(anchor);
 
-                    const pageNum = pagesNormalizadas.findIndex(pText =>
-                        pText.includes(pureAnchor)
-                    ) + 1;
+                    const pageNum = pagesNormalizadas.findIndex(function (pText) {
+                        return pText.includes(pureAnchor);
+                    }) + 1;
 
                     const placeholder = anchor.replace('#ANC_', '{{PAG_').replace('#', '}}');
 
                     if (pageNum > 0) {
-                        console.log(`✅ Âncora ${anchor} -> Página ${pageNum}`);
+                        console.log('✅ Âncora ' + anchor + ' -> Página ' + pageNum);
                         htmlContent = htmlContent.split(placeholder).join(pageNum);
                     } else {
-                        console.log(`❌ Âncora ${anchor} não encontrada. Placeholder será limpo.`);
+                        console.log('❌ Âncora ' + anchor + ' não encontrada. Placeholder será limpo.');
                     }
 
                     htmlContent = htmlContent.split(anchor).join('');
@@ -347,8 +339,8 @@ app.post('/gerar-pdf', async (req, res) => {
             const orfaos = htmlContent.match(/\{\{PAG_[A-Za-z0-9_]+\}\}/g);
             if (orfaos) {
                 const orfaosUnicos = [...new Set(orfaos)];
-                console.log(`🧹 Limpando ${orfaosUnicos.length} placeholder(s) órfão(s):`, orfaosUnicos);
-                orfaosUnicos.forEach(o => {
+                console.log('🧹 Limpando ' + orfaosUnicos.length + ' placeholder(s) órfão(s):', orfaosUnicos);
+                orfaosUnicos.forEach(function (o) {
                     htmlContent = htmlContent.split(o).join('-');
                 });
             }
@@ -380,25 +372,23 @@ app.post('/gerar-pdf', async (req, res) => {
                 if (seg.tipo === 'retrato') {
                     if (seg.html.trim() === '') continue;
 
-                    console.log(`   📄 Renderizando segmento ${i + 1}/${segmentos.length} (retrato)...`);
+                    console.log('   📄 Renderizando segmento ' + (i + 1) + '/' + segmentos.length + ' (retrato)...');
                     await page.setContent(blocoGeometria + seg.html, { waitUntil: 'networkidle0', timeout: 120000 });
                     const buf = await page.pdf(pdfOptionsRetrato);
                     buffersGerados.push(buf);
 
                 } else {
-                    console.log(`   📄 Renderizando segmento ${i + 1}/${segmentos.length} (PAISAGEM)...`);
+                    console.log('   📄 Renderizando segmento ' + (i + 1) + '/' + segmentos.length + ' (PAISAGEM)...');
 
-                    // NOVO: injeta o cabecalho (logos) automaticamente,
-                    // montado 100% aqui na API a partir dos marcadores.
                     const conteudoComCabecalho = injetarCabecalhoPaisagem(seg.html);
 
-                    const docPaisagem = `<!DOCTYPE html><html><head><meta charset="utf-8">
-                        <style>
-                            html, body { margin: 0; padding: 0; }
-                            table { max-width: 100% !important; }
-                            th, td { overflow-wrap: break-word; word-wrap: break-word; }
-                        </style>
-                        </head><body>${conteudoComCabecalho}</body></html>`;
+                    let docPaisagem = '<!DOCTYPE html><html><head><meta charset="utf-8">';
+                    docPaisagem += '<style>';
+                    docPaisagem += 'html, body { margin: 0; padding: 0; }';
+                    docPaisagem += 'table { max-width: 100% !important; }';
+                    docPaisagem += 'th, td { overflow-wrap: break-word; word-wrap: break-word; }';
+                    docPaisagem += '</style>';
+                    docPaisagem += '</head><body>' + conteudoComCabecalho + '</body></html>';
 
                     await page.setContent(docPaisagem, { waitUntil: 'networkidle0', timeout: 120000 });
                     const buf = await page.pdf(pdfOptionsPaisagem);
@@ -412,7 +402,7 @@ app.post('/gerar-pdf', async (req, res) => {
             for (const buf of buffersGerados) {
                 const src = await PDFDocument.load(buf);
                 const paginasCopiadas = await pdfFinal.copyPages(src, src.getPageIndices());
-                paginasCopiadas.forEach(p => pdfFinal.addPage(p));
+                paginasCopiadas.forEach(function (p) { pdfFinal.addPage(p); });
             }
 
             finalPdfBuffer = Buffer.from(await pdfFinal.save());
@@ -438,4 +428,4 @@ app.post('/gerar-pdf', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Ativo na porta ${PORT}`));
+app.listen(PORT, () => console.log('Ativo na porta ' + PORT));
