@@ -1,7 +1,7 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
 const pdfParse = require('pdf-parse');
-const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
+const { PDFDocument, StandardFonts, rgb, PDFName } = require('pdf-lib');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -84,9 +84,6 @@ function extrairEntreMarcadores(html, marcadorInicio, marcadorFim) {
 
 // =========================================================================
 // FUNCAO: injeta o cabecalho (logos) no topo de um segmento em paisagem.
-// Usada apenas quando o template e Siemens-Energy (cabecalho vazio vindo
-// do Power Apps). Nos demais templates, o headerTemplate nativo do
-// Puppeteer ja cobre a pagina em paisagem automaticamente.
 // =========================================================================
 function injetarCabecalhoPaisagem(htmlSegmento) {
     let html = htmlSegmento;
@@ -106,12 +103,13 @@ function injetarCabecalhoPaisagem(htmlSegmento) {
 
     let imgEsq = '';
     if (base64Esq) {
-        imgEsq = '' + base64Esq + '';
+        imgEsq = '<img src="' + base64Esq + '" height="45" />';
     }
 
     let imgDir = '';
     if (base64Dir) {
-        imgDir = '<img src="' + base64Dir }
+        imgDir = '<img src="' + base64Dir + '" height="45" />';
+    }
 
     let cabecalhoHtml = '';
     cabecalhoHtml += '<table width="100%" cellspacing="0" cellpadding="0" ';
@@ -126,8 +124,7 @@ function injetarCabecalhoPaisagem(htmlSegmento) {
 }
 
 // =========================================================================
-// HELPER: remove marcadores de logo sem inserir nada no lugar (usado
-// quando o template NAO e Siemens - o headerTemplate nativo ja resolve).
+// HELPER: remove marcadores de logo sem inserir nada no lugar
 // =========================================================================
 function removerMarcadoresDeLogo(html) {
     let resultado = html;
@@ -140,7 +137,6 @@ function removerMarcadoresDeLogo(html) {
 
 // =========================================================================
 // HELPER: detecta se o cabecalho recebido do Power Apps esta "vazio"
-// (template Siemens-Energy, que envia <div></div>).
 // =========================================================================
 function cabecalhoEstaVazio(headerHtmlProcessado) {
     const semEspacos = headerHtmlProcessado.replace(/\s+/g, '').toLowerCase();
@@ -151,17 +147,6 @@ function cabecalhoEstaVazio(headerHtmlProcessado) {
 // FUNCAO CENTRAL: renderiza um HTML completo em PDF, usando A MESMA logica
 // de segmentacao (retrato/paisagem) tanto para o PDF FANTASMA quanto para
 // o PDF FINAL.
-//
-// ISSO E CRITICO: antes, o PDF fantasma era renderizado como UM UNICO
-// documento continuo em retrato (sem separar a secao em paisagem), mas o
-// PDF final separava essa secao e a renderizava fisicamente em paisagem
-// (297mm), unindo depois com pdf-lib. Como a quantidade de paginas que a
-// tabela de IPs ocupa MUDA dependendo da orientacao/largura disponivel,
-// o FANTASMA contava um numero de paginas DIFERENTE do resultado real -
-// e todo o indice a partir dali saia desviado.
-//
-// Usando esta MESMA funcao para as duas passagens, a paginacao da secao
-// em paisagem fica IDENTICA nas duas - eliminando essa fonte de erro.
 // =========================================================================
 async function renderizarDocumento(page, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens) {
     let temSegmentosPaisagem = false;
@@ -297,6 +282,109 @@ async function corrigirNumeracaoRodape(pdfBuffer) {
     return Buffer.from(await pdfDoc.save());
 }
 
+// =========================================================================
+// NOVA FUNCAO: cria os links de navegacao internos do indice DIRETO no
+// PDF final, via pdf-lib.
+//
+// POR QUE ISSO E NECESSARIO:
+// O <a href='#ancora'> gerado pelo Chromium funciona perfeitamente DENTRO
+// de um unico documento PDF. Mas quando o documento tem secao em paisagem,
+// nos geramos 3 PDFs SEPARADOS e os costuramos com pdf-lib (copyPages).
+// O copyPages copia o CONTEUDO VISUAL corretamente, mas e uma limitacao
+// conhecida da biblioteca que ele NAO recria de forma confiavel os links
+// de navegacao internos (a ligacao entre o texto clicavel e o destino) -
+// por isso a numeracao (que e so texto) ficou perfeita, mas o link se
+// perdia na costura.
+//
+// SOLUCAO: durante a substituicao dos placeholders {{PAG_CAP_X}}, inserimos
+// um MARCADOR INVISIVEL exclusivo logo antes de cada numero. Depois que o
+// PDF final ja esta pronto e costurado, reabrimos ele, localizamos a
+// posicao exata (pagina, x, y) de cada marcador, e desenhamos ali um link
+// de navegacao NATIVO do PDF (uma anotacao Link/GoTo), apontando para a
+// pagina de destino que ja sabemos ser correta (a mesma usada na
+// numeracao, ja validada).
+// =========================================================================
+async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
+    const ocorrencias = [];
+    let contadorPagina = 0;
+
+    function custom_render_page(pageData) {
+        const paginaAtual = contadorPagina;
+        contadorPagina++;
+        return pageData.getTextContent().then(function (textContent) {
+            textContent.items.forEach(function (item) {
+                const match = item.str.match(/@@LNK_([A-Za-z0-9_]+)@@/);
+                if (match) {
+                    ocorrencias.push({
+                        codigo: match[1],
+                        pageIndex: paginaAtual,
+                        x: item.transform[4],
+                        y: item.transform[5]
+                    });
+                }
+            });
+            return '';
+        });
+    }
+
+    await pdfParse(pdfBuffer, { pagerender: custom_render_page });
+
+    if (ocorrencias.length === 0) {
+        console.log('⚠️ Nenhum marcador de link encontrado no PDF final. Links não foram criados.');
+        return pdfBuffer;
+    }
+
+    const pdfDoc = await PDFDocument.load(pdfBuffer);
+    const pages = pdfDoc.getPages();
+    const context = pdfDoc.context;
+
+    const LARGURA_LINK = 42; // pt (~15mm) - cobre o numero de 3 digitos com folga
+    const ALTURA_LINK = 12;  // pt
+
+    let criados = 0;
+
+    ocorrencias.forEach(function (oc) {
+        const destPageNum = mapaDestinos[oc.codigo];
+        if (!destPageNum || destPageNum < 1 || destPageNum > pages.length) return;
+        if (oc.pageIndex < 0 || oc.pageIndex >= pages.length) return;
+
+        const paginaOrigem = pages[oc.pageIndex];
+        const paginaDestino = pages[destPageNum - 1];
+
+        const rectArray = context.obj([oc.x, oc.y - 2, oc.x + LARGURA_LINK, oc.y + ALTURA_LINK]);
+        const destArray = context.obj([paginaDestino.ref, PDFName.of('Fit')]);
+        const borderArray = context.obj([0, 0, 0]);
+
+        const linkDict = context.obj({});
+        linkDict.set(PDFName.of('Type'), PDFName.of('Annot'));
+        linkDict.set(PDFName.of('Subtype'), PDFName.of('Link'));
+        linkDict.set(PDFName.of('Rect'), rectArray);
+        linkDict.set(PDFName.of('Border'), borderArray);
+        linkDict.set(PDFName.of('Dest'), destArray);
+
+        const linkRef = context.register(linkDict);
+
+        const existentesRef = paginaOrigem.node.get(PDFName.of('Annots'));
+        let annotsArray;
+        if (existentesRef) {
+            annotsArray = context.lookup(existentesRef);
+            if (!annotsArray || typeof annotsArray.push !== 'function') {
+                annotsArray = context.obj([]);
+                paginaOrigem.node.set(PDFName.of('Annots'), annotsArray);
+            }
+        } else {
+            annotsArray = context.obj([]);
+            paginaOrigem.node.set(PDFName.of('Annots'), annotsArray);
+        }
+        annotsArray.push(linkRef);
+        criados++;
+    });
+
+    console.log('🔗 ' + criados + ' link(s) de navegação criado(s) no índice.');
+
+    return Buffer.from(await pdfDoc.save());
+}
+
 app.post('/gerar-pdf', async (req, res) => {
     console.log("🚀 Nova requisição de PDF recebida.");
     let browser;
@@ -313,7 +401,7 @@ app.post('/gerar-pdf', async (req, res) => {
         }
 
         // -----------------------------------------------------------------
-        // PARAMETROS (todos com fallback = retrocompatibilidade total)
+        // PARAMETROS
         // -----------------------------------------------------------------
         let htmlContent = req.body.html;
         const headerRaw = req.body.cabecalho || '<div></div>';
@@ -326,21 +414,12 @@ app.post('/gerar-pdf', async (req, res) => {
 
         console.log('⚙️ Config: papel=' + tamanhoPapel + ' | top=' + mTop + ' | bottom=' + mBottom + ' | lateral=' + mLateral);
 
-        // -----------------------------------------------------------------
-        // SUBSTITUICAO DE PLACEHOLDERS NO CABECALHO E RODAPE
-        // -----------------------------------------------------------------
         const headerHtml = headerRaw.split('[MARGEM_LATERAL]').join(mLateral);
         const footerHtml = footerRaw.split('[MARGEM_LATERAL]').join(mLateral);
 
-        // -----------------------------------------------------------------
-        // DETECCAO AUTOMATICA DE TEMPLATE
-        // -----------------------------------------------------------------
         const ehTemplateSiemens = cabecalhoEstaVazio(headerHtml);
-        console.log('🏷️ Template detectado: ' + (ehTemplateSiemens ? 'Siemens-Energy (cabecalho manual necessário)' : 'Outro template (cabecalho nativo já cobre a página em paisagem)'));
+        console.log('🏷️ Template detectado: ' + (ehTemplateSiemens ? 'Siemens-Energy' : 'Outro template'));
 
-        // -----------------------------------------------------------------
-        // BLOCO DE GEOMETRIA + CONTENCAO DE LARGURA (para paginas RETRATO)
-        // -----------------------------------------------------------------
         let blocoGeometria = '';
         blocoGeometria += '<style id="geometria-pagina-api">';
         blocoGeometria += '@page { size: ' + tamanhoPapel + ' portrait; margin: ' + mTop + ' ' + mLateral + ' ' + mBottom + ' ' + mLateral + '; }';
@@ -380,38 +459,21 @@ app.post('/gerar-pdf', async (req, res) => {
 
         const page = await browser.newPage();
 
+        // Guarda, para cada codigo de ancora (ex.: "CAP_3_1"), a pagina de
+        // destino real - usado depois para criar os links de navegacao.
+        const mapaDestinos = {};
+
         // =================================================================
-        // MOTOR DE INDICE INTELIGENTE (TWO-PASS RENDERING) - VERSAO ROBUSTA
-        //
-        // DUAS CORRECOES APLICADAS AQUI:
-        //
-        // 1) DUMMY DE LARGURA FIXA: no PDF fantasma, cada placeholder
-        //    {{PAG_CAP_X}} (que tem tamanhos de texto MUITO diferentes,
-        //    ex: 19 caracteres) e substituido por um numero fake de
-        //    EXATAMENTE 3 digitos ("000"). No PDF final, o numero real
-        //    tambem e formatado com ZERO A ESQUERDA ate 3 digitos
-        //    (ex: "005", "012", "127"). Como o TEXTO tem o MESMO
-        //    COMPRIMENTO EM CARACTERES nas duas passagens, a largura
-        //    renderizada fica identica por construcao - nao depende mais
-        //    de nenhum comportamento especifico de CSS/navegador.
-        //
-        // 2) MESMO MOTOR DE RENDERIZACAO: o PDF fantasma agora usa a
-        //    MESMA funcao renderizarDocumento() que separa e renderiza a
-        //    secao em paisagem fisicamente (297mm) - exatamente como o
-        //    PDF final faz. Antes, o fantasma renderizava tudo em retrato
-        //    continuo, entao a tabela de IPs ocupava uma quantidade de
-        //    paginas DIFERENTE no calculo vs no resultado real. Agora as
-        //    duas passagens usam o MESMO caminho de codigo, garantindo
-        //    paginacao identica.
+        // MOTOR DE INDICE INTELIGENTE (TWO-PASS RENDERING)
         // =================================================================
         if (htmlContent.includes('#ANC_')) {
-            console.log("🔍 Âncoras detectadas! Iniciando motor de índice (versão robusta)...");
+            console.log("🔍 Âncoras detectadas! Iniciando motor de índice...");
 
             const htmlFantasma = htmlContent.replace(/\{\{PAG_CAP_[A-Za-z0-9_]+\}\}/g, '000');
 
             const resultadoFantasma = await renderizarDocumento(page, htmlFantasma, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens);
             const ghostPdfBuffer = resultadoFantasma.buffer;
-            console.log("👻 PDF Fantasma gerado (mesmo motor de renderização do PDF final).");
+            console.log("👻 PDF Fantasma gerado.");
 
             const pdfData = await pdfParse(ghostPdfBuffer, { pagerender: render_page });
             const pages = pdfData.text.split('\n---PAGE_BREAK---\n');
@@ -433,11 +495,18 @@ app.post('/gerar-pdf', async (req, res) => {
                     }) + 1;
 
                     const placeholder = anchor.replace('#ANC_', '{{PAG_').replace('#', '}}');
+                    const codigo = anchor.replace(/^#ANC_/, '').replace(/#$/, '');
 
                     if (pageNum > 0) {
                         const pageNumFormatado = String(pageNum).padStart(3, '0');
                         console.log('✅ Âncora ' + anchor + ' -> Página ' + pageNum + ' (exibido como "' + pageNumFormatado + '")');
-                        htmlContent = htmlContent.split(placeholder).join(pageNumFormatado);
+
+                        // Marcador invisivel + numero formatado.
+                        const marcador = '@@LNK_' + codigo + '@@';
+                        const marcadorHtml = '<span style="font-size:1px;color:#ffffff;">' + marcador + '</span>';
+
+                        htmlContent = htmlContent.split(placeholder).join(marcadorHtml + pageNumFormatado);
+                        mapaDestinos[codigo] = pageNum;
                     } else {
                         console.log('❌ Âncora ' + anchor + ' não encontrada. Placeholder será limpo.');
                     }
@@ -460,7 +529,7 @@ app.post('/gerar-pdf', async (req, res) => {
         }
 
         // =================================================================
-        // IMPRESSAO FINAL - usa a MESMA funcao do PDF fantasma
+        // IMPRESSAO FINAL
         // =================================================================
         console.log("🖨️ Imprimindo PDF Final...");
         const resultadoFinal = await renderizarDocumento(page, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens);
@@ -472,6 +541,14 @@ app.post('/gerar-pdf', async (req, res) => {
         if (resultadoFinal.temSegmentosPaisagem) {
             console.log("🔢 Corrigindo numeração global de páginas no rodapé...");
             finalPdfBuffer = await corrigirNumeracaoRodape(finalPdfBuffer);
+        }
+
+        // =================================================================
+        // CRIACAO DOS LINKS DE NAVEGACAO INTERNOS DO INDICE
+        // =================================================================
+        if (Object.keys(mapaDestinos).length > 0) {
+            console.log("🔗 Criando links de navegação internos no índice...");
+            finalPdfBuffer = await adicionarLinksInternosDoIndice(finalPdfBuffer, mapaDestinos);
         }
 
         console.log("🎉 PDF Finalizado e enviado ao Power Automate!");
