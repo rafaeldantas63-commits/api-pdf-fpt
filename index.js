@@ -6,23 +6,13 @@ const { PDFDocument, StandardFonts, rgb, PDFName } = require('pdf-lib');
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-// =========================================================================
-// MARCADORES DE SECAO EM PAISAGEM
-// =========================================================================
 const LANDSCAPE_START = '<!--LANDSCAPE_START-->';
 const LANDSCAPE_END = '<!--LANDSCAPE_END-->';
-
-// =========================================================================
-// MARCADORES DE LOGO
-// =========================================================================
 const LOGO_ESQ_START = '<!--LOGO_ESQ-->';
 const LOGO_ESQ_END = '<!--/LOGO_ESQ-->';
 const LOGO_DIR_START = '<!--LOGO_DIR-->';
 const LOGO_DIR_END = '<!--/LOGO_DIR-->';
 
-// =========================================================================
-// HELPER: ensina o pdf-parse a marcar a quebra de paginas
-// =========================================================================
 function render_page(pageData) {
     return pageData.getTextContent().then(function (textContent) {
         let text = '';
@@ -33,16 +23,10 @@ function render_page(pageData) {
     });
 }
 
-// =========================================================================
-// HELPER: normaliza texto para busca de ancora
-// =========================================================================
 function normalizarAncora(texto) {
     return texto.replace(/[^a-zA-Z0-9#]/g, '');
 }
 
-// =========================================================================
-// HELPER: divide o HTML final em segmentos alternados
-// =========================================================================
 function dividirEmSegmentos(html) {
     const segmentos = [];
     let restante = html;
@@ -65,9 +49,6 @@ function dividirEmSegmentos(html) {
     return segmentos;
 }
 
-// =========================================================================
-// HELPER: extrai o conteudo entre dois marcadores
-// =========================================================================
 function extrairEntreMarcadores(html, marcadorInicio, marcadorFim) {
     if (!html.includes(marcadorInicio)) {
         return { conteudo: '', htmlRestante: html };
@@ -81,9 +62,6 @@ function extrairEntreMarcadores(html, marcadorInicio, marcadorFim) {
     return { conteudo: conteudo.trim(), htmlRestante: antes + depois };
 }
 
-// =========================================================================
-// FUNCAO: injeta o cabecalho (logos) no topo de um segmento em paisagem.
-// =========================================================================
 function injetarCabecalhoPaisagem(htmlSegmento) {
     let html = htmlSegmento;
 
@@ -102,12 +80,12 @@ function injetarCabecalhoPaisagem(htmlSegmento) {
 
     let imgEsq = '';
     if (base64Esq) {
-        imgEsq = '<img src="' + base64Esq + '" height="45" />';
+        imgEsq = '' + base64Esq + '';
     }
 
     let imgDir = '';
     if (base64Dir) {
-        imgDir = '<img src="' + base64Dir + '" height="45" />';
+        imgDir = '' + base64Dir + '';
     }
 
     let cabecalhoHtml = '';
@@ -122,9 +100,6 @@ function injetarCabecalhoPaisagem(htmlSegmento) {
     return cabecalhoHtml + html;
 }
 
-// =========================================================================
-// HELPER: remove marcadores de logo sem inserir nada no lugar
-// =========================================================================
 function removerMarcadoresDeLogo(html) {
     let resultado = html;
     const logoEsq = extrairEntreMarcadores(resultado, LOGO_ESQ_START, LOGO_ESQ_END);
@@ -134,19 +109,11 @@ function removerMarcadoresDeLogo(html) {
     return resultado;
 }
 
-// =========================================================================
-// HELPER: detecta se o cabecalho recebido do Power Apps esta "vazio"
-// =========================================================================
 function cabecalhoEstaVazio(headerHtmlProcessado) {
     const semEspacos = headerHtmlProcessado.replace(/\s+/g, '').toLowerCase();
     return semEspacos === '<div></div>' || semEspacos === '';
 }
 
-// =========================================================================
-// FUNCAO CENTRAL: renderiza um HTML completo em PDF, usando A MESMA logica
-// de segmentacao (retrato/paisagem) tanto para o PDF FANTASMA quanto para
-// o PDF FINAL.
-// =========================================================================
 async function renderizarDocumento(page, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens) {
     let temSegmentosPaisagem = false;
     let bufferFinal;
@@ -203,9 +170,6 @@ async function renderizarDocumento(page, htmlContent, blocoGeometria, pdfOptions
     return { buffer: bufferFinal, temSegmentosPaisagem: temSegmentosPaisagem };
 }
 
-// =========================================================================
-// CORRECAO DA NUMERACAO GLOBAL "FOLHA: X de Y"
-// =========================================================================
 async function corrigirNumeracaoRodape(pdfBuffer) {
     const pagesItems = [];
 
@@ -282,32 +246,26 @@ async function corrigirNumeracaoRodape(pdfBuffer) {
 }
 
 // =========================================================================
-// FUNCAO: cria os links de navegacao internos do indice DIRETO no PDF
-// final, via pdf-lib.
-//
-// HISTORICO DO DIAGNOSTICO (analisando o texto extraido de um PDF real):
-//
-// 1a tentativa: marcador com opacity:0.02 antes do numero. RESULTADO: o
-// Chromium agrupa texto com opacity!=1 em um ExtGState separado, jogando
-// TODOS os marcadores da pagina para o FINAL do stream, fora de ordem -
-// link ficava em posicao totalmente errada.
-//
-// 2a tentativa: marcador com cor solida branca (sem opacity) antes do
-// numero. RESULTADO (confirmado no texto extraido - "...alimentação
-// @@LNK_CAP_3_1@@003 3.2 Startup..."): a ordem ficou correta (marcador
-// adjacente ao seu capitulo), MAS o marcador, mesmo invisivel, OCUPA
-// ESPAÇO REAL no layout (nao e removido do fluxo por opacity/cor). Como
-// o marcador tem 16-19 caracteres em fonte 9pt, ele EMPURRA o numero
-// visivel varios pontos para a direita - o link (ancorado na posicao do
-// marcador) fica ao lado do numero, nao EM CIMA dele.
-//
-// CORRECAO FINAL (esta versao): o marcador passa a ser inserido DEPOIS
-// do numero (NUMERO + marcador), entao o numero nasce na sua posicao
-// NATURAL, sem ser empurrado por nada. O link e entao desenhado
-// ESTENDENDO-SE PARA TRAS (para a esquerda) a partir da posicao do
-// marcador, cobrindo exatamente a area onde o numero (que vem
-// imediatamente antes dele, sem nada no meio) foi desenhado.
+// NOVA FUNCAO: remove QUALQUER anotacao de Link ja existente em TODAS as
+// paginas do PDF final. Isso elimina os links nativos que o Chromium cria
+// automaticamente a partir de #ancora, os quais ficam quebrados
+// (com Dest orfao) apos o copyPages usado para costurar retrato/paisagem.
+// CONFIRMADO COM TESTE ISOLADO: sem essa limpeza, o link quebrado do
+// Chromium fica sobreposto ao nosso link correto e "ganha" o clique.
 // =========================================================================
+function removerAnotacoesDeLinkExistentes(pdfDoc) {
+    const pages = pdfDoc.getPages();
+    let removidos = 0;
+    pages.forEach(function (pg) {
+        const existentesRef = pg.node.get(PDFName.of('Annots'));
+        if (existentesRef) {
+            pg.node.delete(PDFName.of('Annots'));
+            removidos++;
+        }
+    });
+    console.log('🧹 Anotações pré-existentes removidas de ' + removidos + ' página(s) (elimina links nativos quebrados herdados do copyPages).');
+}
+
 async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
     const ocorrencias = [];
     let contadorPagina = 0;
@@ -348,15 +306,12 @@ async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
     const pages = pdfDoc.getPages();
     const context = pdfDoc.context;
 
-    // -----------------------------------------------------------------------
-    // O link agora e desenhado PARA TRAS (para a esquerda) a partir da
-    // posicao x do marcador, ja que o marcador vem DEPOIS do numero no
-    // texto ("003" + marcador). LARGURA generosa o suficiente para cobrir
-    // um numero de 3 digitos com folga, mesmo com pequenas variacoes de
-    // fonte/kerning entre navegadores.
-    // -----------------------------------------------------------------------
-    const LARGURA_LINK = 34; // pt (~12mm) - cobre o numero de 3 digitos + folga
-    const ALTURA_LINK_EXTRA = 4; // pt de folga acima/abaixo
+    // Remove qualquer link nativo/quebrado herdado do copyPages ANTES de
+    // adicionarmos os nossos.
+    removerAnotacoesDeLinkExistentes(pdfDoc);
+
+    const LARGURA_LINK = 34;
+    const ALTURA_LINK_EXTRA = 4;
 
     let criados = 0;
 
@@ -373,10 +328,8 @@ async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
 
         const alturaLink = oc.fontHeight + ALTURA_LINK_EXTRA;
 
-        // Rect estende-se PARA A ESQUERDA a partir de oc.x (posicao do
-        // marcador), cobrindo o numero que foi desenhado logo antes dele.
         const rectX0 = Math.max(0, oc.x - LARGURA_LINK);
-        const rectX1 = oc.x + 2; // pequena folga a direita tambem
+        const rectX1 = oc.x + 2;
 
         const linkDict = context.obj({});
         linkDict.set(PDFName.of('Type'), PDFName.of('Annot'));
@@ -407,7 +360,7 @@ async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
         annotsArray.push(linkRef);
         criados++;
 
-        console.log('🔗 Link criado: ' + oc.codigo + ' (página origem ' + (oc.pageIndex + 1) + ') -> página destino ' + destPageNum + ' | rect x=[' + rectX0.toFixed(1) + ',' + rectX1.toFixed(1) + ']');
+        console.log('🔗 Link criado: ' + oc.codigo + ' (página origem ' + (oc.pageIndex + 1) + ') -> página destino ' + destPageNum);
     });
 
     console.log('🔗 Total: ' + criados + ' link(s) de navegação criado(s) no índice.');
@@ -420,9 +373,6 @@ app.post('/gerar-pdf', async (req, res) => {
     let browser;
 
     try {
-        // -----------------------------------------------------------------
-        // VALIDACAO DE ENTRADA
-        // -----------------------------------------------------------------
         if (!req.body || typeof req.body.html !== 'string' || req.body.html.trim() === '') {
             console.error("⚠️ Requisição inválida: campo 'html' ausente ou vazio.");
             return res.status(400).json({
@@ -430,9 +380,6 @@ app.post('/gerar-pdf', async (req, res) => {
             });
         }
 
-        // -----------------------------------------------------------------
-        // PARAMETROS
-        // -----------------------------------------------------------------
         let htmlContent = req.body.html;
         const headerRaw = req.body.cabecalho || '<div></div>';
         const footerRaw = req.body.rodape || '<div></div>';
@@ -491,9 +438,6 @@ app.post('/gerar-pdf', async (req, res) => {
 
         const mapaDestinos = {};
 
-        // =================================================================
-        // MOTOR DE INDICE INTELIGENTE (TWO-PASS RENDERING)
-        // =================================================================
         if (htmlContent.includes('#ANC_')) {
             console.log("🔍 Âncoras detectadas! Iniciando motor de índice...");
 
@@ -529,13 +473,6 @@ app.post('/gerar-pdf', async (req, res) => {
                         const pageNumFormatado = String(pageNum).padStart(3, '0');
                         console.log('✅ Âncora ' + anchor + ' -> Página ' + pageNum + ' (exibido como "' + pageNumFormatado + '")');
 
-                        // -----------------------------------------------------
-                        // CORRIGIDO: o marcador agora vem DEPOIS do numero
-                        // (NUMERO + marcador), nao antes. Assim o numero
-                        // nasce na sua posicao NATURAL, sem ser empurrado
-                        // pela largura do texto do marcador (que, mesmo
-                        // branco/invisivel, ocupa espaco real no layout).
-                        // -----------------------------------------------------
                         const marcador = '@@LNK_' + codigo + '@@';
                         const marcadorHtml = '<span style="color:#ffffff;font-size:9pt;">' + marcador + '</span>';
 
@@ -562,24 +499,15 @@ app.post('/gerar-pdf', async (req, res) => {
             console.log("⏩ Nenhuma âncora encontrada, gerando direto.");
         }
 
-        // =================================================================
-        // IMPRESSAO FINAL
-        // =================================================================
         console.log("🖨️ Imprimindo PDF Final...");
         const resultadoFinal = await renderizarDocumento(page, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens);
         let finalPdfBuffer = resultadoFinal.buffer;
 
-        // =================================================================
-        // CORRECAO DA NUMERACAO GLOBAL DO RODAPE
-        // =================================================================
         if (resultadoFinal.temSegmentosPaisagem) {
             console.log("🔢 Corrigindo numeração global de páginas no rodapé...");
             finalPdfBuffer = await corrigirNumeracaoRodape(finalPdfBuffer);
         }
 
-        // =================================================================
-        // CRIACAO DOS LINKS DE NAVEGACAO INTERNOS DO INDICE
-        // =================================================================
         if (Object.keys(mapaDestinos).length > 0) {
             console.log("🔗 Criando links de navegação internos no índice...");
             finalPdfBuffer = await adicionarLinksInternosDoIndice(finalPdfBuffer, mapaDestinos);
