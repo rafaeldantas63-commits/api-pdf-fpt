@@ -1,21 +1,30 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
 const pdfParse = require('pdf-parse');
-const { PDFDocument } = require('pdf-lib');
+const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
 // =========================================================================
-// MARCADORES USADOS PARA IDENTIFICAR BLOCOS EM PAISAGEM.
-// Sao simples comentarios HTML, invisiveis, inseridos pelo Power Apps
-// (btn_Controle_14) ao redor de qualquer capitulo que deva sair como
-// pagina fisica em paisagem. Para adicionar um novo capitulo em
-// paisagem no futuro, basta envolve-lo com os MESMOS marcadores -
-// nao precisa mexer em mais nada aqui.
+// MARCADORES DE SECAO EM PAISAGEM
 // =========================================================================
 const LANDSCAPE_START = '<!--LANDSCAPE_START-->';
 const LANDSCAPE_END = '<!--LANDSCAPE_END-->';
+
+// =========================================================================
+// MARCADORES DE LOGO (novo)
+//
+// O Power Apps entrega apenas o Base64 CRU envolvido nesses marcadores.
+// E a API quem decide: como montar a tag <img>, qual tamanho usar, e
+// onde posicionar o cabecalho na pagina em paisagem. Isso elimina os
+// varios bugs de truncamento que ocorriam ao montar a tag <img> dentro
+// de formulas complexas do Power Apps.
+// =========================================================================
+const LOGO_ESQ_START = '<!--LOGO_ESQ-->';
+const LOGO_ESQ_END = '<!--/LOGO_ESQ-->';
+const LOGO_DIR_START = '<!--LOGO_DIR-->';
+const LOGO_DIR_END = '<!--/LOGO_DIR-->';
 
 // =========================================================================
 // HELPER: ensina o pdf-parse a marcar a quebra de paginas
@@ -40,8 +49,6 @@ function normalizarAncora(texto) {
 // =========================================================================
 // HELPER: divide o HTML final em segmentos alternados
 // [retrato, paisagem, retrato, paisagem, ..., retrato]
-// usando busca de STRING simples (nao depende de leitura de PDF,
-// portanto e 100% confiavel e imune a qualquer reflow de paginacao).
 // =========================================================================
 function dividirEmSegmentos(html) {
     const segmentos = [];
@@ -59,6 +66,142 @@ function dividirEmSegmentos(html) {
     segmentos.push({ tipo: 'retrato', html: restante });
 
     return segmentos;
+}
+
+// =========================================================================
+// HELPER (NOVO): extrai o conteudo entre dois marcadores e retorna o
+// texto SEM os marcadores, junto com o texto original SEM aquele trecho.
+// =========================================================================
+function extrairEntreMarcadores(html, marcadorInicio, marcadorFim) {
+    if (!html.includes(marcadorInicio)) {
+        return { conteudo: '', htmlRestante: html };
+    }
+    const [antes, resto] = html.split(marcadorInicio);
+    const [conteudo, depois] = resto.split(marcadorFim);
+    return { conteudo: conteudo.trim(), htmlRestante: antes + depois };
+}
+
+// =========================================================================
+// FUNCAO NOVA: injeta o cabecalho (logos) no topo de um segmento em
+// paisagem.
+//
+// A API e quem decide TUDO sobre o cabecalho:
+// - a tag <img> e montada aqui, nao no Power Apps
+// - o tamanho (height='45') e definido aqui, igual ao padrao usado em
+//   todas as demais paginas do relatorio
+// - o logo do cliente so aparece se houver Base64 de fato (nao mostra
+//   icone de imagem quebrada quando o campo esta vazio)
+// - a posicao (tabela no topo, com borda inferior azul) e definida aqui
+//
+// O Power Apps so precisa fornecer os dois Base64 crus, envolvidos nos
+// marcadores <!--LOGO_ESQ--> e <!--LOGO_DIR-->.
+// =========================================================================
+function injetarCabecalhoPaisagem(htmlSegmento) {
+    let html = htmlSegmento;
+
+    const logoEsq = extrairEntreMarcadores(html, LOGO_ESQ_START, LOGO_ESQ_END);
+    html = logoEsq.htmlRestante;
+
+    const logoDir = extrairEntreMarcadores(html, LOGO_DIR_START, LOGO_DIR_END);
+    html = logoDir.htmlRestante;
+
+    const base64Esq = logoEsq.conteudo;
+    const base64Dir = logoDir.conteudo;
+
+    // Se nenhum logo foi fornecido, nao adiciona cabecalho nenhum.
+    if (!base64Esq && !base64Dir) {
+        return html;
+    }
+
+    const imgEsq = base64Esq
+        ? `<img src="${base64Esq}" '';
+
+    const imgDir = base64Dir
+        ? `<img src="${base64Dir}" height="45"nst cabecalhoHtml = `
+        <table width="100%" cellspacing="0" cellpadding="0" style="border:none;border-bottom:2px solid #003366;margin-bottom:15px;padding-bottom:10px;">
+            <tr>
+                <td align="left" style="border:none;padding:0;vertical-align:middle;">${imgEsq}</td>
+                <td align="right" style="border:none;padding:0;vertical-align:middle;">${imgDir}</td>
+            </tr>
+        </table>
+    `;
+
+    return cabecalhoHtml + html;
+}
+
+// =========================================================================
+// CORRECAO DA NUMERACAO GLOBAL "FOLHA: X de Y"
+// (mantida igual a versao anterior)
+// =========================================================================
+async function corrigirNumeracaoRodape(pdfBuffer) {
+    const pagesItems = [];
+
+    function custom_render_page(pageData) {
+        return pageData.getTextContent().then(function (textContent) {
+            const items = textContent.items.map(item => ({
+                str: item.str,
+                x: item.transform[4],
+                y: item.transform[5],
+                width: item.width,
+                fontHeight: Math.hypot(item.transform[2], item.transform[3]) || 8.5
+            }));
+            pagesItems.push(items);
+            return '';
+        });
+    }
+
+    await pdfParse(pdfBuffer, { pagerender: custom_render_page });
+
+    const pdfDoc = await PDFDocument.load(pdfBuffer);
+    const totalPaginas = pdfDoc.getPageCount();
+    const fonteCorrecao = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+    for (let i = 0; i < pagesItems.length; i++) {
+        const items = pagesItems[i];
+
+        const idxMarcador = items.findIndex(it => /FOLHA\s*:?/i.test(it.str));
+        if (idxMarcador === -1) {
+            console.log(`⚠️ Página ${i + 1}: marcador "FOLHA" não encontrado, numeração não corrigida nesta página.`);
+            continue;
+        }
+
+        const baseY = items[idxMarcador].y;
+        const baseX = items[idxMarcador].x;
+
+        const itensDaLinha = items.filter(it =>
+            Math.abs(it.y - baseY) < 2 && it.x >= baseX - 2
+        );
+
+        if (itensDaLinha.length === 0) continue;
+
+        const minX = Math.min(...itensDaLinha.map(it => it.x));
+        const maxX = Math.max(...itensDaLinha.map(it => it.x + it.width));
+        const fontSize = items[idxMarcador].fontHeight;
+        const alturaCaixa = fontSize * 1.5;
+        const yCaixa = baseY - alturaCaixa * 0.3;
+
+        const pagina = pdfDoc.getPage(i);
+
+        pagina.drawRectangle({
+            x: minX - 3,
+            y: yCaixa,
+            width: (maxX - minX) + 6,
+            height: alturaCaixa,
+            color: rgb(1, 1, 1)
+        });
+
+        pagina.drawText(`FOLHA: ${i + 1} de ${totalPaginas}`, {
+            x: minX,
+            y: baseY,
+            size: fontSize,
+            font: fonteCorrecao,
+            color: rgb(0, 0, 0)
+        });
+
+        console.log(`✅ Página ${i + 1}: numeração corrigida para "FOLHA: ${i + 1} de ${totalPaginas}".`);
+    }
+
+    return Buffer.from(await pdfDoc.save());
 }
 
 app.post('/gerar-pdf', async (req, res) => {
@@ -129,7 +272,6 @@ app.post('/gerar-pdf', async (req, res) => {
 </style>
 `;
 
-        // Opcoes de PDF para paginas em RETRATO (documento principal)
         const pdfOptionsRetrato = {
             format: tamanhoPapel,
             printBackground: true,
@@ -141,10 +283,6 @@ app.post('/gerar-pdf', async (req, res) => {
             timeout: 120000
         };
 
-        // Opcoes de PDF para paginas em PAISAGEM (papel fisico deitado).
-        // NAO usa preferCSSPageSize, pois nao injetamos nenhum @page custom
-        // nesse conteudo - deixamos o Puppeteer controlar o tamanho/orientacao
-        // nativamente atraves de "landscape:true", que e o metodo confiavel.
         const pdfOptionsPaisagem = {
             format: tamanhoPapel,
             landscape: true,
@@ -166,20 +304,6 @@ app.post('/gerar-pdf', async (req, res) => {
 
         // =================================================================
         // MOTOR DE INDICE INTELIGENTE (TWO-PASS RENDERING)
-        //
-        // Este passo usa um PDF "fantasma" de TODO o documento (incluindo
-        // os marcadores de paisagem, que aqui sao apenas ignorados/tratados
-        // como texto invisivel) apenas para descobrir em que pagina cada
-        // ancora cai, e assim resolver os {{PAG_CAP_X}} do indice.
-        //
-        // NOTA/LIMITACAO CONHECIDA: como o PDF fantasma renderiza tudo em
-        // retrato continuo (sem separar a secao em paisagem fisica), a
-        // contagem de paginas dele pode nao bater 100% com o PDF final
-        // (que tera uma pagina fisica diferente para o trecho em
-        // paisagem). Isso pode gerar uma pequena divergencia no numero
-        // exibido no indice para capitulos MUITO proximos ao trecho em
-        // paisagem - um problema ja identificado e que sera tratado
-        // separadamente, sem relacao com a orientacao da tabela.
         // =================================================================
         if (htmlContent.includes('#ANC_')) {
             console.log("🔍 Âncoras detectadas! Iniciando motor de índice...");
@@ -235,13 +359,9 @@ app.post('/gerar-pdf', async (req, res) => {
 
         // =================================================================
         // IMPRESSAO FINAL
-        //
-        // Se NAO houver marcador de paisagem, gera um unico PDF (caminho
-        // simples, igual ao de sempre). Se houver, divide o HTML em
-        // segmentos e renderiza CADA UM com a orientacao correta, depois
-        // junta tudo em um unico PDF final usando pdf-lib.
         // =================================================================
         let finalPdfBuffer;
+        let temSegmentosPaisagem = false;
 
         if (!htmlContent.includes(LANDSCAPE_START)) {
             console.log("🖨️ Imprimindo PDF Final (documento único, sem seções em paisagem)...");
@@ -249,6 +369,7 @@ app.post('/gerar-pdf', async (req, res) => {
             finalPdfBuffer = await page.pdf(pdfOptionsRetrato);
 
         } else {
+            temSegmentosPaisagem = true;
             console.log("🖨️ Documento contém seção(ões) em paisagem. Renderizando em partes separadas...");
             const segmentos = dividirEmSegmentos(htmlContent);
             const buffersGerados = [];
@@ -257,8 +378,6 @@ app.post('/gerar-pdf', async (req, res) => {
                 const seg = segmentos[i];
 
                 if (seg.tipo === 'retrato') {
-                    // Segmentos retrato vazios (ex.: quando a secao em
-                    // paisagem esta logo no inicio ou no final) sao pulados.
                     if (seg.html.trim() === '') continue;
 
                     console.log(`   📄 Renderizando segmento ${i + 1}/${segmentos.length} (retrato)...`);
@@ -267,17 +386,19 @@ app.post('/gerar-pdf', async (req, res) => {
                     buffersGerados.push(buf);
 
                 } else {
-                    // Segmento em PAISAGEM: monta um documento HTML minimo e
-                    // independente, sem a geometria de retrato, e renderiza
-                    // com landscape:true (pagina fisica deitada de verdade).
                     console.log(`   📄 Renderizando segmento ${i + 1}/${segmentos.length} (PAISAGEM)...`);
+
+                    // NOVO: injeta o cabecalho (logos) automaticamente,
+                    // montado 100% aqui na API a partir dos marcadores.
+                    const conteudoComCabecalho = injetarCabecalhoPaisagem(seg.html);
+
                     const docPaisagem = `<!DOCTYPE html><html><head><meta charset="utf-8">
                         <style>
                             html, body { margin: 0; padding: 0; }
                             table { max-width: 100% !important; }
                             th, td { overflow-wrap: break-word; word-wrap: break-word; }
                         </style>
-                        </head><body>${seg.html}</body></html>`;
+                        </head><body>${conteudoComCabecalho}</body></html>`;
 
                     await page.setContent(docPaisagem, { waitUntil: 'networkidle0', timeout: 120000 });
                     const buf = await page.pdf(pdfOptionsPaisagem);
@@ -285,10 +406,6 @@ app.post('/gerar-pdf', async (req, res) => {
                 }
             }
 
-            // -------------------------------------------------------------
-            // MERGE: junta todos os PDFs parciais em um unico documento
-            // final, preservando a orientacao de cada pagina individual.
-            // -------------------------------------------------------------
             console.log("🔗 Unindo os segmentos em um único PDF final...");
             const pdfFinal = await PDFDocument.create();
 
@@ -299,6 +416,14 @@ app.post('/gerar-pdf', async (req, res) => {
             }
 
             finalPdfBuffer = Buffer.from(await pdfFinal.save());
+        }
+
+        // =================================================================
+        // CORRECAO DA NUMERACAO GLOBAL DO RODAPE
+        // =================================================================
+        if (temSegmentosPaisagem) {
+            console.log("🔢 Corrigindo numeração global de páginas no rodapé...");
+            finalPdfBuffer = await corrigirNumeracaoRodape(finalPdfBuffer);
         }
 
         console.log("🎉 PDF Finalizado e enviado ao Power Automate!");
