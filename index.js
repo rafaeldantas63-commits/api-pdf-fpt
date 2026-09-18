@@ -42,7 +42,6 @@ function normalizarAncora(texto) {
 
 // =========================================================================
 // HELPER: divide o HTML final em segmentos alternados
-// [retrato, paisagem, retrato, paisagem, ..., retrato]
 // =========================================================================
 function dividirEmSegmentos(html) {
     const segmentos = [];
@@ -286,24 +285,28 @@ async function corrigirNumeracaoRodape(pdfBuffer) {
 // FUNCAO: cria os links de navegacao internos do indice DIRETO no PDF
 // final, via pdf-lib.
 //
-// DIAGNOSTICO DO PROBLEMA ANTERIOR (confirmado analisando o texto extraido
-// do PDF real): todos os marcadores @@LNK_CAP_X@@ apareciam AGRUPADOS no
-// final do texto da pagina, em vez de cada um proximo ao seu respectivo
-// capitulo - mesmo com o indice aparecendo visualmente correto no PDF.
+// HISTORICO DO DIAGNOSTICO (analisando o texto extraido de um PDF real):
 //
-// CAUSA: o marcador usava "opacity:0.02". Elementos com opacity != 1
-// exigem que o Chromium desenhe usando um ExtGState de transparencia no
-// PDF. Para economizar trocas de estado grafico, o Chromium AGRUPA todo
-// o texto que usa a MESMA opacidade e o escreve de uma vez no stream do
-// PDF - fora da ordem/posicao visual real. Isso nao quebrava a tecnica
-// das ancoras #ANC_CAP_X# (que so precisa saber EM QUAL PAGINA o texto
-// aparece), mas quebrava esta tecnica de link (que precisa da posicao
-// x/y EXATA de cada marcador individualmente).
+// 1a tentativa: marcador com opacity:0.02 antes do numero. RESULTADO: o
+// Chromium agrupa texto com opacity!=1 em um ExtGState separado, jogando
+// TODOS os marcadores da pagina para o FINAL do stream, fora de ordem -
+// link ficava em posicao totalmente errada.
 //
-// CORRECAO: o marcador passa a usar uma cor solida IGUAL AO FUNDO DA
-// PAGINA (branco) em vez de opacity. Isso continua invisivel a olho nu,
-// mas NAO aciona nenhum ExtGState de transparencia - o Chromium escreve
-// o texto na ordem/posicao normal do fluxo, preservando o x/y correto.
+// 2a tentativa: marcador com cor solida branca (sem opacity) antes do
+// numero. RESULTADO (confirmado no texto extraido - "...alimentação
+// @@LNK_CAP_3_1@@003 3.2 Startup..."): a ordem ficou correta (marcador
+// adjacente ao seu capitulo), MAS o marcador, mesmo invisivel, OCUPA
+// ESPAÇO REAL no layout (nao e removido do fluxo por opacity/cor). Como
+// o marcador tem 16-19 caracteres em fonte 9pt, ele EMPURRA o numero
+// visivel varios pontos para a direita - o link (ancorado na posicao do
+// marcador) fica ao lado do numero, nao EM CIMA dele.
+//
+// CORRECAO FINAL (esta versao): o marcador passa a ser inserido DEPOIS
+// do numero (NUMERO + marcador), entao o numero nasce na sua posicao
+// NATURAL, sem ser empurrado por nada. O link e entao desenhado
+// ESTENDENDO-SE PARA TRAS (para a esquerda) a partir da posicao do
+// marcador, cobrindo exatamente a area onde o numero (que vem
+// imediatamente antes dele, sem nada no meio) foi desenhado.
 // =========================================================================
 async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
     const ocorrencias = [];
@@ -345,7 +348,14 @@ async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
     const pages = pdfDoc.getPages();
     const context = pdfDoc.context;
 
-    const LARGURA_LINK = 56; // pt
+    // -----------------------------------------------------------------------
+    // O link agora e desenhado PARA TRAS (para a esquerda) a partir da
+    // posicao x do marcador, ja que o marcador vem DEPOIS do numero no
+    // texto ("003" + marcador). LARGURA generosa o suficiente para cobrir
+    // um numero de 3 digitos com folga, mesmo com pequenas variacoes de
+    // fonte/kerning entre navegadores.
+    // -----------------------------------------------------------------------
+    const LARGURA_LINK = 34; // pt (~12mm) - cobre o numero de 3 digitos + folga
     const ALTURA_LINK_EXTRA = 4; // pt de folga acima/abaixo
 
     let criados = 0;
@@ -363,13 +373,18 @@ async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
 
         const alturaLink = oc.fontHeight + ALTURA_LINK_EXTRA;
 
+        // Rect estende-se PARA A ESQUERDA a partir de oc.x (posicao do
+        // marcador), cobrindo o numero que foi desenhado logo antes dele.
+        const rectX0 = Math.max(0, oc.x - LARGURA_LINK);
+        const rectX1 = oc.x + 2; // pequena folga a direita tambem
+
         const linkDict = context.obj({});
         linkDict.set(PDFName.of('Type'), PDFName.of('Annot'));
         linkDict.set(PDFName.of('Subtype'), PDFName.of('Link'));
         linkDict.set(PDFName.of('Rect'), context.obj([
-            oc.x,
+            rectX0,
             oc.y - 2,
-            oc.x + LARGURA_LINK,
+            rectX1,
             oc.y + alturaLink
         ]));
         linkDict.set(PDFName.of('Border'), context.obj([0, 0, 0]));
@@ -392,7 +407,7 @@ async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
         annotsArray.push(linkRef);
         criados++;
 
-        console.log('🔗 Link criado: ' + oc.codigo + ' (página origem ' + (oc.pageIndex + 1) + ') -> página destino ' + destPageNum);
+        console.log('🔗 Link criado: ' + oc.codigo + ' (página origem ' + (oc.pageIndex + 1) + ') -> página destino ' + destPageNum + ' | rect x=[' + rectX0.toFixed(1) + ',' + rectX1.toFixed(1) + ']');
     });
 
     console.log('🔗 Total: ' + criados + ' link(s) de navegação criado(s) no índice.');
@@ -474,8 +489,6 @@ app.post('/gerar-pdf', async (req, res) => {
 
         const page = await browser.newPage();
 
-        // Guarda, para cada codigo de ancora (ex.: "CAP_3_1"), a pagina de
-        // destino real - usado depois para criar os links de navegacao.
         const mapaDestinos = {};
 
         // =================================================================
@@ -517,21 +530,16 @@ app.post('/gerar-pdf', async (req, res) => {
                         console.log('✅ Âncora ' + anchor + ' -> Página ' + pageNum + ' (exibido como "' + pageNumFormatado + '")');
 
                         // -----------------------------------------------------
-                        // Marcador invisivel + numero formatado.
-                        //
-                        // CORRIGIDO: usa cor SOLIDA branca (igual ao fundo da
-                        // pagina) em vez de opacity. Isso evita que o Chromium
-                        // agrupe este texto em um ExtGState de transparencia
-                        // separado, o que estava fazendo TODOS os marcadores
-                        // da pagina serem escritos fora de ordem/posicao no
-                        // stream do PDF (confirmado analisando o texto extraido
-                        // do PDF real - todos os marcadores apareciam juntos no
-                        // final da pagina, em vez de proximos aos seus titulos).
+                        // CORRIGIDO: o marcador agora vem DEPOIS do numero
+                        // (NUMERO + marcador), nao antes. Assim o numero
+                        // nasce na sua posicao NATURAL, sem ser empurrado
+                        // pela largura do texto do marcador (que, mesmo
+                        // branco/invisivel, ocupa espaco real no layout).
                         // -----------------------------------------------------
                         const marcador = '@@LNK_' + codigo + '@@';
                         const marcadorHtml = '<span style="color:#ffffff;font-size:9pt;">' + marcador + '</span>';
 
-                        htmlContent = htmlContent.split(placeholder).join(marcadorHtml + pageNumFormatado);
+                        htmlContent = htmlContent.split(placeholder).join(pageNumFormatado + marcadorHtml);
                         mapaDestinos[codigo] = pageNum;
                     } else {
                         console.log('❌ Âncora ' + anchor + ' não encontrada. Placeholder será limpo.');
