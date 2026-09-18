@@ -293,16 +293,24 @@ async function corrigirNumeracaoRodape(pdfBuffer) {
 
 // =========================================================================
 // FUNCAO UNIFICADA: realinha os numeros do indice a margem REAL da pagina,
-// ESTENDE o pontilhado ate a nova posicao (fecha o gap deixado pelo
-// deslocamento) e cria os links de navegacao internos - tudo numa unica
+// REDESENHA a linha pontilhada INTEIRA (nao so um pedaco) num unico estilo
+// consistente, e cria os links de navegacao internos - tudo numa unica
 // passagem sobre o PDF final.
 //
-// NOVO NESTA VERSAO: apos mover o numero para a margem real, o pontilhado
-// (.toc-dots) desenhado pelo Chromium ainda termina na posicao ANTIGA do
-// numero (calculada com base no contentor externo desconhecido). Isso
-// deixava um vao vazio entre o fim dos pontinhos e o numero reposicionado.
-// Agora a API desenha pontinhos ADICIONAIS cobrindo exatamente esse vao,
-// na mesma altura da linha pontilhada original, fechando o gap.
+// MUDANCA IMPORTANTE NESTA VERSAO: a tentativa anterior so DESENHAVA
+// pontinhos ADICIONAIS no vao (gap) entre o fim do pontilhado original
+// (renderizado pelo Chromium via CSS border-bottom:dotted) e a nova
+// posicao do numero. Isso criava uma EMENDA VISIVEL, porque o estilo dos
+// pontinhos desenhados pela API (via drawCircle) e diferente do estilo
+// renderizado pelo motor de fontes do Chromium - ficavam DOIS padroes de
+// pontilhado distintos na mesma linha, lado a lado.
+//
+// CORRECAO: em vez de completar o pontilhado existente, a API agora
+// APAGA a linha pontilhada ORIGINAL POR INTEIRO (do fim do texto do
+// titulo ate a antiga posicao do numero) e REDESENHA TUDO do zero, num
+// UNICO estilo, do fim do titulo ate a nova posicao do numero. Como toda
+// a linha passa a ser desenhada por nos, nao existe mais risco de dois
+// estilos se encontrarem.
 // =========================================================================
 async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
     const pagesItems = [];
@@ -326,8 +334,9 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
     await pdfParse(pdfBuffer, { pagerender: custom_render_page });
 
     // Localiza todas as ocorrencias de marcador "@@LNK_codigo@@" e, para
-    // cada uma, o item do NUMERO (3 digitos) imediatamente anterior na
-    // MESMA linha - esse e o texto visivel que sera realinhado.
+    // cada uma: (a) o NUMERO (3 digitos) imediatamente anterior na mesma
+    // linha, e (b) o fim do TEXTO DO TITULO na mesma linha (para saber
+    // onde a linha pontilhada deve comecar).
     const ocorrencias = [];
     for (let p = 0; p < pagesItems.length; p++) {
         const items = pagesItems[p];
@@ -337,22 +346,41 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
             if (!match) continue;
 
             const codigo = match[1];
+
+            // Busca o numero de 3 digitos imediatamente antes, na mesma linha
             let numItem = null;
             for (let k = idx - 1; k >= 0; k--) {
                 const cand = items[k];
-                if (Math.abs(cand.y - item.y) > 2) break; // saiu da linha
+                if (Math.abs(cand.y - item.y) > 2) break;
                 if (/^\d{3}$/.test(cand.str.trim())) {
                     numItem = cand;
                     break;
                 }
             }
 
+            const rowY = numItem ? numItem.y : item.y;
+
+            // Busca o fim do texto do TITULO na mesma linha: o maior
+            // (x+width) entre todos os itens dessa linha que vem ANTES
+            // do numero (ou do marcador, se numero nao encontrado) e que
+            // nao sao o proprio numero nem o marcador.
+            let titleEndX = null;
+            const limiteX = numItem ? numItem.x : item.x;
+            items.forEach(function (it) {
+                if (Math.abs(it.y - rowY) > 2) return;
+                if (it === numItem || it === item) return;
+                if (it.x >= limiteX) return;
+                const rightEdge = it.x + it.width;
+                if (titleEndX === null || rightEdge > titleEndX) titleEndX = rightEdge;
+            });
+
             ocorrencias.push({
                 codigo: codigo,
                 pageIndex: p,
                 markerX: item.x,
                 markerY: item.y,
-                numItem: numItem
+                numItem: numItem,
+                titleEndX: titleEndX
             });
         }
     }
@@ -373,14 +401,14 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
     const BUFFER_MARGEM = 2; // pt de folga entre o numero e a margem real
     const LARGURA_LINK_PADRAO = 34; // usado como fallback se nao achar o numero
 
-    // Parametros da extensao do pontilhado (para fechar o gap)
-    const DOT_RAIO = 0.6; // pt - raio de cada pontinho desenhado
-    const DOT_ESPACAMENTO = 4; // pt - distancia entre centros dos pontinhos
+    // Parametros do pontilhado UNICO (usado para redesenhar a linha inteira)
+    const DOT_RADIUS = 0.4; // pt
+    const DOT_PERIOD = 2.5; // pt entre centros dos pontinhos
     const DOT_COR = rgb(0, 0, 0);
 
     let realinhados = 0;
     let linksCriados = 0;
-    let pontosEstendidos = 0;
+    let linhasRedesenhadas = 0;
 
     ocorrencias.forEach(function (oc) {
         const destPageNum = mapaDestinos[oc.codigo];
@@ -404,26 +432,56 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
 
             // So redesenha se o desvio for perceptivel (>0.5pt)
             if (Math.abs(delta) > 0.5) {
-                // Deteccao de negrito: capitulos principais (ex: "2_1",
-                // "3_1") tem 1 underscore no codigo; subitens (ex: "2_1_1",
-                // "3_2_2_1") tem 2 ou mais - mesmo padrao usado na montagem
-                // visual do indice (linhas principais em negrito).
                 const numUnderscores = (oc.codigo.match(/_/g) || []).length;
                 const ehNegrito = numUnderscores === 1;
                 const fonteEscolhida = ehNegrito ? fonteBold : fonteNormal;
+                const novoX = numItem.x + delta;
 
-                // Apaga o numero antigo
-                paginaOrigem.drawRectangle({
-                    x: numItem.x - 2,
-                    y: numItem.y - 2,
-                    width: numItem.width + 4,
-                    height: numItem.fontHeight + 4,
-                    color: rgb(1, 1, 1)
-                });
+                if (oc.titleEndX !== null) {
+                    // -------------------------------------------------
+                    // CAMINHO PRINCIPAL: redesenha a linha pontilhada
+                    // INTEIRA (do fim do titulo ate o numero), num unico
+                    // estilo - elimina qualquer risco de emenda visivel.
+                    // -------------------------------------------------
+                    const dotY = numItem.y - 1.5;
 
-                // Redesenha na posicao correta, rente a margem real
+                    // Apaga TUDO entre o fim do titulo e a maior extensao
+                    // (posicao antiga OU nova do numero, o que for maior)
+                    const whiteFromX = oc.titleEndX + 2;
+                    const whiteToX = Math.max(currentRightX, novoX + numItem.width) + 4;
+
+                    paginaOrigem.drawRectangle({
+                        x: whiteFromX,
+                        y: dotY - 2,
+                        width: Math.max(0, whiteToX - whiteFromX),
+                        height: 6,
+                        color: rgb(1, 1, 1)
+                    });
+
+                    // Redesenha o pontilhado INTEIRO, de um so estilo,
+                    // do fim do titulo ate pouco antes do numero novo
+                    const dotsFromX = oc.titleEndX + 4;
+                    const dotsToX = novoX - 3;
+                    for (let px = dotsFromX; px < dotsToX; px += DOT_PERIOD) {
+                        paginaOrigem.drawCircle({ x: px, y: dotY, size: DOT_RADIUS, color: DOT_COR });
+                    }
+
+                    linhasRedesenhadas++;
+                } else {
+                    // Fallback (nao deveria ocorrer): apenas apaga e
+                    // redesenha o numero, sem mexer no pontilhado.
+                    paginaOrigem.drawRectangle({
+                        x: numItem.x - 2,
+                        y: numItem.y - 2,
+                        width: numItem.width + 4,
+                        height: numItem.fontHeight + 4,
+                        color: rgb(1, 1, 1)
+                    });
+                }
+
+                // Redesenha o numero na posicao correta, rente a margem real
                 paginaOrigem.drawText(numItem.str, {
-                    x: numItem.x + delta,
+                    x: novoX,
                     y: numItem.y,
                     size: numItem.fontHeight,
                     font: fonteEscolhida,
@@ -432,46 +490,21 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
 
                 realinhados++;
 
-                // ---------------------------------------------------------
-                // NOVO: ESTENDE O PONTILHADO ate a nova posicao do numero,
-                // fechando o gap deixado pelo deslocamento. Os pontinhos do
-                // Chromium (.toc-dots) terminavam na posicao ANTIGA do
-                // numero (numItem.x); desenhamos pontinhos adicionais desse
-                // ponto ate a nova posicao (numItem.x + delta), na mesma
-                // altura aproximada da linha pontilhada original (um pouco
-                // abaixo da base do texto, imitando um border-bottom).
-                // ---------------------------------------------------------
-                if (delta > 0) {
-                    const dotY = numItem.y - 1.5; // logo abaixo da base do texto
-                    const inicioGap = numItem.x - 2; // onde os pontinhos originais paravam
-                    const fimGap = numItem.x + delta - 2; // um pouco antes do numero novo
-
-                    for (let px = inicioGap; px < fimGap; px += DOT_ESPACAMENTO) {
-                        paginaOrigem.drawCircle({
-                            x: px,
-                            y: dotY,
-                            size: DOT_RAIO,
-                            color: DOT_COR
-                        });
-                        pontosEstendidos++;
-                    }
-                }
+                rectX0 = Math.max(0, novoX - 2);
+                rectX1 = novoX + numItem.width + 2;
+                rectY0 = numItem.y - 2;
+                rectY1 = numItem.y + numItem.fontHeight + 2;
+            } else {
+                // Desvio insignificante - nao mexe em nada, so cria o link
+                // na posicao atual do numero.
+                rectX0 = Math.max(0, numItem.x - 2);
+                rectX1 = numItem.x + numItem.width + 2;
+                rectY0 = numItem.y - 2;
+                rectY1 = numItem.y + numItem.fontHeight + 2;
             }
-
-            // Area do link cobre EXATAMENTE a caixa do numero na posicao
-            // NOVA (ja deslocada). IMPORTANTE: nao usar a posicao do
-            // marcador antigo aqui - como o numero pode se deslocar bastante
-            // para alcancar a margem real, o marcador (que nao se move)
-            // pode ficar a ESQUERDA do numero reposicionado, gerando um
-            // retangulo invertido (x0>x1) e um link invalido.
-            const novoX = numItem.x + delta;
-            rectX0 = Math.max(0, novoX - 2);
-            rectX1 = novoX + numItem.width + 2;
-            rectY0 = numItem.y - 2;
-            rectY1 = numItem.y + numItem.fontHeight + 2;
         } else {
-            // Fallback: nao achou o numero (nao deveria acontecer) - cria
-            // o link na posicao antiga do marcador, como antes.
+            // Fallback: nao achou o numero - cria o link na posicao antiga
+            // do marcador.
             rectX0 = Math.max(0, oc.markerX - LARGURA_LINK_PADRAO);
             rectX1 = oc.markerX + 2;
             rectY0 = oc.markerY - 2;
@@ -502,11 +535,11 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
         annotsArray.push(linkRef);
         linksCriados++;
 
-        console.log('🔗 ' + oc.codigo + ' -> página ' + destPageNum + (oc.numItem ? ' (número realinhado)' : ' (número não localizado, fallback aplicado)'));
+        console.log('🔗 ' + oc.codigo + ' -> página ' + destPageNum + (oc.numItem ? ' (número realinhado)' : ' (fallback aplicado)'));
     });
 
     console.log('📐 ' + realinhados + ' número(s) de índice realinhado(s) à margem real da página.');
-    console.log('⋯ ' + pontosEstendidos + ' pontinho(s) desenhado(s) para fechar o gap do pontilhado.');
+    console.log('⋯ ' + linhasRedesenhadas + ' linha(s) pontilhada(s) redesenhada(s) por inteiro (estilo único).');
     console.log('🔗 Total: ' + linksCriados + ' link(s) de navegação criado(s) no índice.');
 
     return Buffer.from(await pdfDoc.save());
@@ -669,12 +702,12 @@ app.post('/gerar-pdf', async (req, res) => {
         }
 
         // =================================================================
-        // REALINHAMENTO DOS NUMEROS DO INDICE + EXTENSAO DO PONTILHADO +
+        // REALINHAMENTO DOS NUMEROS DO INDICE + REDESENHO DO PONTILHADO +
         // CRIACAO DOS LINKS INTERNOS (roda sempre que houver indice com
         // marcadores, independente de haver secao em paisagem ou nao)
         // =================================================================
         if (Object.keys(mapaDestinos).length > 0) {
-            console.log("📐 Processando índice (realinhamento + pontilhado + links)...");
+            console.log("📐 Processando índice (realinhamento + pontilhado único + links)...");
             const mLateralPt = mmParaPt(mLateral);
             finalPdfBuffer = await processarIndice(finalPdfBuffer, mapaDestinos, mLateralPt);
         }
