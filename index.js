@@ -160,15 +160,6 @@ async function corrigirNumeracaoRodape(pdfBuffer) {
 // =========================================================================
 // REALINHA numeros do indice a margem real + redesenha a linha pontilhada
 // INTEIRA (title->numero) num unico estilo + cria os links.
-//
-// FIX DEFINITIVO: a versao anterior so apagava uma faixa "calculada" entre
-// o titulo e o numero, o que deixava resíduos visiveis quando o calculo
-// de delta era negativo ou a deteccao de fim de titulo variava. Agora a
-// faixa apagada vai SEMPRE do fim do titulo ATE A BORDA DIREITA REAL DA
-// PAGINA (nao ate um ponto calculado) - impossivel sobrar qualquer
-// resíduo do numero antigo ou de pontinhos antigos, nao importa o valor
-// de delta. Depois disso, redesenha o pontilhado (unico estilo) e o
-// numero na posicao final, dentro dessa mesma area já 100% limpa.
 // =========================================================================
 async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
     const pagesItems = [];
@@ -192,6 +183,7 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
             const codigo = match[1];
 
             let numItem = null;
+            // Busca o numero (ex: "002") antes da marca invisivel
             for (let k = idx - 1; k >= 0; k--) {
                 const cand = items[k];
                 if (Math.abs(cand.y - item.y) > 2) break;
@@ -199,15 +191,34 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
             }
 
             const rowY = numItem ? numItem.y : item.y;
-            let titleEndX = null;
-            const limiteX = numItem ? numItem.x : item.x;
-            items.forEach(function (it) {
-                if (Math.abs(it.y - rowY) > 2) return;
-                if (it === numItem || it === item) return;
-                if (it.x >= limiteX) return;
-                const rightEdge = it.x + it.width;
-                if (titleEndX === null || rightEdge > titleEndX) titleEndX = rightEdge;
-            });
+            
+            // NOVO CALCULO DA LARGURA DO TITULO
+            // Ao inves de varrer a linha inteira (que quebra se houver residuos longos),
+            // varremos da esquerda ate bater nos primeiros pontos do indice ou espacos vazios grandes.
+            let titleEndX = 0;
+            let temTituloNaLinha = false;
+            
+            // Ordena os itens da linha da esquerda para a direita
+            const itensLinha = items.filter(it => Math.abs(it.y - rowY) <= 2).sort((a,b) => a.x - b.x);
+            
+            for (let cand of itensLinha) {
+                // Se chegou no numero da pagina ou marcador invisivel, para.
+                if (cand === numItem || cand === item) break;
+                
+                // Se bateu nos pontinhos gerados nativamente pelo navegador, para.
+                if (cand.str.includes('......')) break; 
+                
+                const rightEdge = cand.x + cand.width;
+                if (rightEdge > titleEndX) {
+                    titleEndX = rightEdge;
+                    temTituloNaLinha = true;
+                }
+            }
+
+            // Se nao achou nada, cai pra um fallback defensivo
+            if (!temTituloNaLinha && numItem) {
+                titleEndX = numItem.x - 50; 
+            }
 
             ocorrencias.push({ codigo: codigo, pageIndex: p, markerX: item.x, markerY: item.y, numItem: numItem, titleEndX: titleEndX });
         }
@@ -249,13 +260,13 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
             const rowHeight = rowBottom - rowTop;
 
             // ---------------------------------------------------------
-            // APAGA TUDO do fim do titulo ATE A BORDA FISICA DA PAGINA.
-            // Nao ha calculo de "onde parar" - vai ate o fim real da
-            // pagina, entao e IMPOSSIVEL sobrar qualquer resquicio do
-            // numero antigo ou do pontilhado antigo, seja qual for o
-            // valor de delta (positivo, negativo, grande ou pequeno).
+            // APAGA TUDO A PARTIR DA MARGEM SEGURA.
+            // Recuamos um pouco menos para garantir que a ultima letra
+            // do titulo nao seja comida pela caixa branca.
             // ---------------------------------------------------------
-            const whiteFromX = oc.titleEndX + 2;
+            // Adicionamos +4 pixels de respiro apos a ultima letra
+            const whiteFromX = oc.titleEndX + 4; 
+            
             paginaOrigem.drawRectangle({
                 x: whiteFromX,
                 y: rowTop,
@@ -264,10 +275,9 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
                 color: rgb(1, 1, 1)
             });
 
-            // Redesenha o pontilhado INTEIRO, de um so estilo, do fim
-            // do titulo ate pouco antes do numero (na posicao final).
+            // Redesenha o pontilhado INTEIRO a partir da margem segura
             const dotY = numItem.y - 1.5;
-            const dotsFromX = oc.titleEndX + 4;
+            const dotsFromX = whiteFromX + 2;
             const dotsToX = novoX - 3;
             for (let px = dotsFromX; px < dotsToX; px += DOT_PERIOD) {
                 paginaOrigem.drawCircle({ x: px, y: dotY, size: DOT_RADIUS, color: rgb(0, 0, 0) });
