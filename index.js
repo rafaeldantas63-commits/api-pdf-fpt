@@ -71,8 +71,7 @@ function dividirEmSegmentos(html) {
 }
 
 // =========================================================================
-// HELPER: extrai o conteudo entre dois marcadores e retorna o texto SEM
-// os marcadores, junto com o texto original SEM aquele trecho.
+// HELPER: extrai o conteudo entre dois marcadores
 // =========================================================================
 function extrairEntreMarcadores(html, marcadorInicio, marcadorFim) {
     if (!html.includes(marcadorInicio)) {
@@ -88,18 +87,27 @@ function extrairEntreMarcadores(html, marcadorInicio, marcadorFim) {
 }
 
 // =========================================================================
+// HELPER (NOVO): detecta se o cabecalho recebido do Power Apps esta
+// "vazio" (ou seja, o template e Siemens-Energy, que envia <div></div>
+// porque o cabecalho real vive dentro do <thead> da wrapper-table).
+//
+// Quando o cabecalho tem conteudo real (templates como Axia, que usam
+// o headerTemplate nativo do Puppeteer), esta funcao retorna false -
+// e nesse caso NAO injetamos cabecalho manual no segmento em paisagem,
+// porque o headerTemplate ja se aplica automaticamente a TODAS as
+// paginas, incluindo a em paisagem.
+// =========================================================================
+function cabecalhoEstaVazio(headerHtmlProcessado) {
+    const semEspacos = headerHtmlProcessado.replace(/\s+/g, '').toLowerCase();
+    return semEspacos === '<div></div>' || semEspacos === '';
+}
+
+// =========================================================================
 // FUNCAO: injeta o cabecalho (logos) no topo de um segmento em paisagem.
 //
-// A API decide TUDO sobre o cabecalho:
-// - a tag <img> e montada aqui, nao no Power Apps
-// - o tamanho (height=45) e definido aqui, igual ao padrao usado em
-//   todas as demais paginas do relatorio
-// - o logo do cliente so aparece se houver Base64 de fato
-// - a posicao (tabela no topo, com borda inferior azul) e definida aqui
-//
-// REESCRITA SEM TEMPLATE LITERALS MULTILINHA (sem crase com quebra de
-// linha dentro). Usa apenas concatenacao simples com "+", para evitar
-// que duas linhas se fundam acidentalmente durante copia/cola.
+// Usada APENAS quando o template e Siemens-Energy (cabecalho vazio vindo
+// da API). Nos demais templates (Axia, etc.) o headerTemplate nativo do
+// Puppeteer ja resolve isso sozinho, e esta funcao nao e chamada.
 // =========================================================================
 function injetarCabecalhoPaisagem(htmlSegmento) {
     let html = htmlSegmento;
@@ -137,6 +145,22 @@ function injetarCabecalhoPaisagem(htmlSegmento) {
     cabecalhoHtml += '</table>';
 
     return cabecalhoHtml + html;
+}
+
+// =========================================================================
+// HELPER (NOVO): remove os marcadores de logo do HTML sem inserir nada
+// no lugar. Usado quando o template NAO e Siemens (cabecalho ja vem
+// pronto via headerTemplate nativo) - os marcadores e o Base64 cru que
+// o Power Apps sempre envia precisam ser limpos para nao aparecer como
+// texto solto na pagina renderizada.
+// =========================================================================
+function removerMarcadoresDeLogo(html) {
+    let resultado = html;
+    const logoEsq = extrairEntreMarcadores(resultado, LOGO_ESQ_START, LOGO_ESQ_END);
+    resultado = logoEsq.htmlRestante;
+    const logoDir = extrairEntreMarcadores(resultado, LOGO_DIR_START, LOGO_DIR_END);
+    resultado = logoDir.htmlRestante;
+    return resultado;
 }
 
 // =========================================================================
@@ -253,6 +277,24 @@ app.post('/gerar-pdf', async (req, res) => {
         const footerHtml = footerRaw.split('[MARGEM_LATERAL]').join(mLateral);
 
         // -----------------------------------------------------------------
+        // DETECCAO AUTOMATICA DE TEMPLATE (NOVO)
+        //
+        // Se o cabecalho recebido estiver vazio (<div></div>), o template
+        // e o Siemens-Energy - nesse caso o cabecalho real vive dentro do
+        // <thead> da wrapper-table, que o segmento em paisagem NAO herda
+        // (ele e renderizado como documento HTML separado). Por isso
+        // precisamos injetar manualmente os logos ali.
+        //
+        // Se o cabecalho vier com conteudo (Axia ou qualquer outro
+        // template), o headerTemplate nativo do Puppeteer ja se aplica
+        // automaticamente a TODAS as paginas - incluindo a em paisagem -
+        // entao NAO injetamos nada, apenas limpamos os marcadores de logo
+        // (que o Power Apps sempre envia, independente do template).
+        // -----------------------------------------------------------------
+        const ehTemplateSiemens = cabecalhoEstaVazio(headerHtml);
+        console.log('🏷️ Template detectado: ' + (ehTemplateSiemens ? 'Siemens-Energy (cabecalho manual necessário)' : 'Outro template (cabecalho nativo já cobre a página em paisagem)'));
+
+        // -----------------------------------------------------------------
         // BLOCO DE GEOMETRIA + CONTENCAO DE LARGURA (para paginas RETRATO)
         // -----------------------------------------------------------------
         let blocoGeometria = '';
@@ -357,6 +399,10 @@ app.post('/gerar-pdf', async (req, res) => {
 
         if (!htmlContent.includes(LANDSCAPE_START)) {
             console.log("🖨️ Imprimindo PDF Final (documento único, sem seções em paisagem)...");
+            // Mesmo sem paisagem, os marcadores de logo podem existir no
+            // corpo (caso algum capitulo os inclua por engano) - limpamos
+            // por seguranca antes de imprimir.
+            htmlContent = removerMarcadoresDeLogo(htmlContent);
             await page.setContent(blocoGeometria + htmlContent, { waitUntil: 'networkidle0', timeout: 120000 });
             finalPdfBuffer = await page.pdf(pdfOptionsRetrato);
 
@@ -373,14 +419,25 @@ app.post('/gerar-pdf', async (req, res) => {
                     if (seg.html.trim() === '') continue;
 
                     console.log('   📄 Renderizando segmento ' + (i + 1) + '/' + segmentos.length + ' (retrato)...');
-                    await page.setContent(blocoGeometria + seg.html, { waitUntil: 'networkidle0', timeout: 120000 });
+                    const htmlRetratoLimpo = removerMarcadoresDeLogo(seg.html);
+                    await page.setContent(blocoGeometria + htmlRetratoLimpo, { waitUntil: 'networkidle0', timeout: 120000 });
                     const buf = await page.pdf(pdfOptionsRetrato);
                     buffersGerados.push(buf);
 
                 } else {
                     console.log('   📄 Renderizando segmento ' + (i + 1) + '/' + segmentos.length + ' (PAISAGEM)...');
 
-                    const conteudoComCabecalho = injetarCabecalhoPaisagem(seg.html);
+                    // -----------------------------------------------------
+                    // NOVO: so injeta o cabecalho manual se o template for
+                    // Siemens-Energy. Nos demais templates (Axia, etc.), o
+                    // headerTemplate nativo do Puppeteer ja cobre a pagina
+                    // em paisagem automaticamente - so removemos os
+                    // marcadores de logo (que sempre chegam do Power Apps)
+                    // sem inserir nada no lugar deles.
+                    // -----------------------------------------------------
+                    const conteudoComCabecalho = ehTemplateSiemens
+                        ? injetarCabecalhoPaisagem(seg.html)
+                        : removerMarcadoresDeLogo(seg.html);
 
                     let docPaisagem = '<!DOCTYPE html><html><head><meta charset="utf-8">';
                     docPaisagem += '<style>';
