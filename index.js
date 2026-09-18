@@ -6,13 +6,33 @@ const { PDFDocument, StandardFonts, rgb, PDFName } = require('pdf-lib');
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
+// =========================================================================
+// MARCADORES DE SECAO EM PAISAGEM
+// =========================================================================
 const LANDSCAPE_START = '<!--LANDSCAPE_START-->';
 const LANDSCAPE_END = '<!--LANDSCAPE_END-->';
+
+// =========================================================================
+// MARCADORES DE LOGO
+// =========================================================================
 const LOGO_ESQ_START = '<!--LOGO_ESQ-->';
 const LOGO_ESQ_END = '<!--/LOGO_ESQ-->';
 const LOGO_DIR_START = '<!--LOGO_DIR-->';
 const LOGO_DIR_END = '<!--/LOGO_DIR-->';
 
+// =========================================================================
+// HELPER: converte string tipo "15mm" em pontos PDF (1mm = 2.83465pt)
+// =========================================================================
+function mmParaPt(valorStr) {
+    if (!valorStr) return 0;
+    const numero = parseFloat(String(valorStr).replace(',', '.'));
+    if (isNaN(numero)) return 0;
+    return numero * 2.83465;
+}
+
+// =========================================================================
+// HELPER: ensina o pdf-parse a marcar a quebra de paginas
+// =========================================================================
 function render_page(pageData) {
     return pageData.getTextContent().then(function (textContent) {
         let text = '';
@@ -23,10 +43,16 @@ function render_page(pageData) {
     });
 }
 
+// =========================================================================
+// HELPER: normaliza texto para busca de ancora
+// =========================================================================
 function normalizarAncora(texto) {
     return texto.replace(/[^a-zA-Z0-9#]/g, '');
 }
 
+// =========================================================================
+// HELPER: divide o HTML final em segmentos alternados
+// =========================================================================
 function dividirEmSegmentos(html) {
     const segmentos = [];
     let restante = html;
@@ -49,6 +75,9 @@ function dividirEmSegmentos(html) {
     return segmentos;
 }
 
+// =========================================================================
+// HELPER: extrai o conteudo entre dois marcadores
+// =========================================================================
 function extrairEntreMarcadores(html, marcadorInicio, marcadorFim) {
     if (!html.includes(marcadorInicio)) {
         return { conteudo: '', htmlRestante: html };
@@ -62,6 +91,9 @@ function extrairEntreMarcadores(html, marcadorInicio, marcadorFim) {
     return { conteudo: conteudo.trim(), htmlRestante: antes + depois };
 }
 
+// =========================================================================
+// FUNCAO: injeta o cabecalho (logos) no topo de um segmento em paisagem.
+// =========================================================================
 function injetarCabecalhoPaisagem(htmlSegmento) {
     let html = htmlSegmento;
 
@@ -80,12 +112,12 @@ function injetarCabecalhoPaisagem(htmlSegmento) {
 
     let imgEsq = '';
     if (base64Esq) {
-        imgEsq = '' + base64Esq + '';
+        imgEsq = '<img src="' + base64Esq + '" height="45" />';
     }
 
     let imgDir = '';
     if (base64Dir) {
-        imgDir = '' + base64Dir + '';
+        imgDir = '<img src="' + base64Dir + '" height="45" />';
     }
 
     let cabecalhoHtml = '';
@@ -100,6 +132,9 @@ function injetarCabecalhoPaisagem(htmlSegmento) {
     return cabecalhoHtml + html;
 }
 
+// =========================================================================
+// HELPER: remove marcadores de logo sem inserir nada no lugar
+// =========================================================================
 function removerMarcadoresDeLogo(html) {
     let resultado = html;
     const logoEsq = extrairEntreMarcadores(resultado, LOGO_ESQ_START, LOGO_ESQ_END);
@@ -109,11 +144,19 @@ function removerMarcadoresDeLogo(html) {
     return resultado;
 }
 
+// =========================================================================
+// HELPER: detecta se o cabecalho recebido do Power Apps esta "vazio"
+// =========================================================================
 function cabecalhoEstaVazio(headerHtmlProcessado) {
     const semEspacos = headerHtmlProcessado.replace(/\s+/g, '').toLowerCase();
     return semEspacos === '<div></div>' || semEspacos === '';
 }
 
+// =========================================================================
+// FUNCAO CENTRAL: renderiza um HTML completo em PDF, usando A MESMA logica
+// de segmentacao (retrato/paisagem) tanto para o PDF FANTASMA quanto para
+// o PDF FINAL.
+// =========================================================================
 async function renderizarDocumento(page, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens) {
     let temSegmentosPaisagem = false;
     let bufferFinal;
@@ -170,6 +213,9 @@ async function renderizarDocumento(page, htmlContent, blocoGeometria, pdfOptions
     return { buffer: bufferFinal, temSegmentosPaisagem: temSegmentosPaisagem };
 }
 
+// =========================================================================
+// CORRECAO DA NUMERACAO GLOBAL "FOLHA: X de Y"
+// =========================================================================
 async function corrigirNumeracaoRodape(pdfBuffer) {
     const pagesItems = [];
 
@@ -246,74 +292,98 @@ async function corrigirNumeracaoRodape(pdfBuffer) {
 }
 
 // =========================================================================
-// NOVA FUNCAO: remove QUALQUER anotacao de Link ja existente em TODAS as
-// paginas do PDF final. Isso elimina os links nativos que o Chromium cria
-// automaticamente a partir de #ancora, os quais ficam quebrados
-// (com Dest orfao) apos o copyPages usado para costurar retrato/paisagem.
-// CONFIRMADO COM TESTE ISOLADO: sem essa limpeza, o link quebrado do
-// Chromium fica sobreposto ao nosso link correto e "ganha" o clique.
+// FUNCAO UNIFICADA: realinha os numeros do indice à margem REAL da pagina
+// (independente de qualquer CSS/contentor externo desconhecido, como o
+// CabecalhoHTML do template Siemens-Energy) E cria os links de navegacao
+// internos, tudo numa unica passagem sobre o PDF final.
+//
+// POR QUE ISSO ERA NECESSARIO (causa raiz real, agora identificada):
+// No template Siemens-Energy, o botao (btn_Controle_7 / btn_Controle_14)
+// usa varCorpoInicial = varCabecalhoPronto quando o template e
+// Siemens-Energy - ou seja, NENHUMA das classes CSS (.pagina-a4,
+// .wrapper-table) e sequer aplicada nesse caminho. O contentor real que
+// envolve o indice vem do campo CabecalhoHTML armazenado no SharePoint,
+// um conteudo totalmente opaco para quem edita apenas os controles
+// html_IndiceX. Por isso nenhum ajuste de CSS dentro do indice conseguia
+// garantir alinhamento correto com a margem real da pagina.
+//
+// SOLUCAO: em vez de tentar adivinhar o CSS externo, a API agora
+// reposiciona os numeros DIRETAMENTE no PDF ja gerado, calculando a
+// margem real a partir da largura da pagina e do parametro mLateral
+// (que a propria API ja conhece com precisao) - 100% deterministico,
+// independente de qualquer contentor externo.
 // =========================================================================
-function removerAnotacoesDeLinkExistentes(pdfDoc) {
-    const pages = pdfDoc.getPages();
-    let removidos = 0;
-    pages.forEach(function (pg) {
-        const existentesRef = pg.node.get(PDFName.of('Annots'));
-        if (existentesRef) {
-            pg.node.delete(PDFName.of('Annots'));
-            removidos++;
-        }
-    });
-    console.log('🧹 Anotações pré-existentes removidas de ' + removidos + ' página(s) (elimina links nativos quebrados herdados do copyPages).');
-}
-
-async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
-    const ocorrencias = [];
-    let contadorPagina = 0;
+async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
+    const pagesItems = [];
 
     function custom_render_page(pageData) {
-        const paginaAtual = contadorPagina;
-        contadorPagina++;
         return pageData.getTextContent().then(function (textContent) {
-            textContent.items.forEach(function (item) {
-                const match = item.str.match(/@@LNK_([A-Za-z0-9_]+)@@/);
-                if (match) {
-                    ocorrencias.push({
-                        codigo: match[1],
-                        pageIndex: paginaAtual,
-                        x: item.transform[4],
-                        y: item.transform[5],
-                        fontHeight: Math.hypot(item.transform[2], item.transform[3]) || 9
-                    });
-                }
+            const items = textContent.items.map(function (item) {
+                return {
+                    str: item.str,
+                    x: item.transform[4],
+                    y: item.transform[5],
+                    width: item.width,
+                    fontHeight: Math.hypot(item.transform[2], item.transform[3]) || 9
+                };
             });
+            pagesItems.push(items);
             return '';
         });
     }
 
     await pdfParse(pdfBuffer, { pagerender: custom_render_page });
 
+    // Localiza todas as ocorrencias de marcador "@@LNK_codigo@@" e, para
+    // cada uma, o item do NUMERO (3 digitos) imediatamente anterior na
+    // MESMA linha - esse e o texto visivel que sera realinhado.
+    const ocorrencias = [];
+    for (let p = 0; p < pagesItems.length; p++) {
+        const items = pagesItems[p];
+        for (let idx = 0; idx < items.length; idx++) {
+            const item = items[idx];
+            const match = item.str.match(/@@LNK_([A-Za-z0-9_]+)@@/);
+            if (!match) continue;
+
+            const codigo = match[1];
+            let numItem = null;
+            for (let k = idx - 1; k >= 0; k--) {
+                const cand = items[k];
+                if (Math.abs(cand.y - item.y) > 2) break; // saiu da linha
+                if (/^\d{3}$/.test(cand.str.trim())) {
+                    numItem = cand;
+                    break;
+                }
+            }
+
+            ocorrencias.push({
+                codigo: codigo,
+                pageIndex: p,
+                markerX: item.x,
+                markerY: item.y,
+                numItem: numItem
+            });
+        }
+    }
+
     console.log('🔎 Marcadores de link encontrados no texto: ' + ocorrencias.length);
-    ocorrencias.forEach(function (oc) {
-        console.log('   - ' + oc.codigo + ' | página ' + (oc.pageIndex + 1) + ' | x=' + oc.x.toFixed(1) + ' y=' + oc.y.toFixed(1));
-    });
 
     if (ocorrencias.length === 0) {
-        console.log('⚠️ Nenhum marcador de link encontrado no PDF final. Links não foram criados.');
+        console.log('⚠️ Nenhum marcador de link encontrado no PDF final. Nada a processar.');
         return pdfBuffer;
     }
 
     const pdfDoc = await PDFDocument.load(pdfBuffer);
     const pages = pdfDoc.getPages();
     const context = pdfDoc.context;
+    const fonteNormal = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const fonteBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
 
-    // Remove qualquer link nativo/quebrado herdado do copyPages ANTES de
-    // adicionarmos os nossos.
-    removerAnotacoesDeLinkExistentes(pdfDoc);
+    const BUFFER_MARGEM = 2; // pt de folga entre o numero e a margem real
+    const LARGURA_LINK_PADRAO = 34; // usado como fallback se nao achar o numero
 
-    const LARGURA_LINK = 34;
-    const ALTURA_LINK_EXTRA = 4;
-
-    let criados = 0;
+    let realinhados = 0;
+    let linksCriados = 0;
 
     ocorrencias.forEach(function (oc) {
         const destPageNum = mapaDestinos[oc.codigo];
@@ -325,21 +395,72 @@ async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
 
         const paginaOrigem = pages[oc.pageIndex];
         const paginaDestino = pages[destPageNum - 1];
+        const pageWidth = paginaOrigem.getWidth();
+        const targetRightX = pageWidth - mLateralPt - BUFFER_MARGEM;
 
-        const alturaLink = oc.fontHeight + ALTURA_LINK_EXTRA;
+        let rectX0, rectX1, rectY0, rectY1;
 
-        const rectX0 = Math.max(0, oc.x - LARGURA_LINK);
-        const rectX1 = oc.x + 2;
+        if (oc.numItem) {
+            const numItem = oc.numItem;
+            const currentRightX = numItem.x + numItem.width;
+            const delta = targetRightX - currentRightX;
+
+            // So redesenha se o desvio for perceptivel (>0.5pt)
+            if (Math.abs(delta) > 0.5) {
+                // Deteccao de negrito: capitulos principais (ex: "2_1",
+                // "3_1") tem 1 underscore no codigo; subitens (ex: "2_1_1",
+                // "3_2_2_1") tem 2 ou mais - e o mesmo padrao usado na
+                // montagem visual do indice (linhas principais em negrito).
+                const numUnderscores = (oc.codigo.match(/_/g) || []).length;
+                const ehNegrito = numUnderscores === 1;
+                const fonteEscolhida = ehNegrito ? fonteBold : fonteNormal;
+
+                // Apaga o numero antigo
+                paginaOrigem.drawRectangle({
+                    x: numItem.x - 2,
+                    y: numItem.y - 2,
+                    width: numItem.width + 4,
+                    height: numItem.fontHeight + 4,
+                    color: rgb(1, 1, 1)
+                });
+
+                // Redesenha na posicao correta, rente a margem real
+                paginaOrigem.drawText(numItem.str, {
+                    x: numItem.x + delta,
+                    y: numItem.y,
+                    size: numItem.fontHeight,
+                    font: fonteEscolhida,
+                    color: rgb(0, 0, 0)
+                });
+
+                realinhados++;
+            }
+
+            // Area do link cobre EXATAMENTE a caixa do numero na posicao
+            // NOVA (ja deslocada). IMPORTANTE: nao usar a posicao do
+            // marcador antigo aqui - como o numero pode se deslocar bastante
+            // para alcancar a margem real, o marcador (que nao se move)
+            // pode ficar a ESQUERDA do numero reposicionado, gerando um
+            // retangulo invertido (x0>x1) e um link invalido. Confirmado
+            // com teste isolado antes desta correcao.
+            const novoX = numItem.x + delta;
+            rectX0 = Math.max(0, novoX - 2);
+            rectX1 = novoX + numItem.width + 2;
+            rectY0 = numItem.y - 2;
+            rectY1 = numItem.y + numItem.fontHeight + 2;
+        } else {
+            // Fallback: nao achou o numero (nao deveria acontecer) - cria
+            // o link na posicao antiga do marcador, como antes.
+            rectX0 = Math.max(0, oc.markerX - LARGURA_LINK_PADRAO);
+            rectX1 = oc.markerX + 2;
+            rectY0 = oc.markerY - 2;
+            rectY1 = oc.markerY + 12;
+        }
 
         const linkDict = context.obj({});
         linkDict.set(PDFName.of('Type'), PDFName.of('Annot'));
         linkDict.set(PDFName.of('Subtype'), PDFName.of('Link'));
-        linkDict.set(PDFName.of('Rect'), context.obj([
-            rectX0,
-            oc.y - 2,
-            rectX1,
-            oc.y + alturaLink
-        ]));
+        linkDict.set(PDFName.of('Rect'), context.obj([rectX0, rectY0, rectX1, rectY1]));
         linkDict.set(PDFName.of('Border'), context.obj([0, 0, 0]));
         linkDict.set(PDFName.of('Dest'), context.obj([paginaDestino.ref, PDFName.of('Fit')]));
 
@@ -358,12 +479,13 @@ async function adicionarLinksInternosDoIndice(pdfBuffer, mapaDestinos) {
             paginaOrigem.node.set(PDFName.of('Annots'), annotsArray);
         }
         annotsArray.push(linkRef);
-        criados++;
+        linksCriados++;
 
-        console.log('🔗 Link criado: ' + oc.codigo + ' (página origem ' + (oc.pageIndex + 1) + ') -> página destino ' + destPageNum);
+        console.log('🔗 ' + oc.codigo + ' -> página ' + destPageNum + (oc.numItem ? ' (número realinhado)' : ' (número não localizado, fallback aplicado)'));
     });
 
-    console.log('🔗 Total: ' + criados + ' link(s) de navegação criado(s) no índice.');
+    console.log('📐 ' + realinhados + ' número(s) de índice realinhado(s) à margem real da página.');
+    console.log('🔗 Total: ' + linksCriados + ' link(s) de navegação criado(s) no índice.');
 
     return Buffer.from(await pdfDoc.save());
 }
@@ -373,6 +495,9 @@ app.post('/gerar-pdf', async (req, res) => {
     let browser;
 
     try {
+        // -----------------------------------------------------------------
+        // VALIDACAO DE ENTRADA
+        // -----------------------------------------------------------------
         if (!req.body || typeof req.body.html !== 'string' || req.body.html.trim() === '') {
             console.error("⚠️ Requisição inválida: campo 'html' ausente ou vazio.");
             return res.status(400).json({
@@ -380,6 +505,9 @@ app.post('/gerar-pdf', async (req, res) => {
             });
         }
 
+        // -----------------------------------------------------------------
+        // PARAMETROS
+        // -----------------------------------------------------------------
         let htmlContent = req.body.html;
         const headerRaw = req.body.cabecalho || '<div></div>';
         const footerRaw = req.body.rodape || '<div></div>';
@@ -438,6 +566,9 @@ app.post('/gerar-pdf', async (req, res) => {
 
         const mapaDestinos = {};
 
+        // =================================================================
+        // MOTOR DE INDICE INTELIGENTE (TWO-PASS RENDERING)
+        // =================================================================
         if (htmlContent.includes('#ANC_')) {
             console.log("🔍 Âncoras detectadas! Iniciando motor de índice...");
 
@@ -499,18 +630,33 @@ app.post('/gerar-pdf', async (req, res) => {
             console.log("⏩ Nenhuma âncora encontrada, gerando direto.");
         }
 
+        // =================================================================
+        // IMPRESSAO FINAL
+        // =================================================================
         console.log("🖨️ Imprimindo PDF Final...");
         const resultadoFinal = await renderizarDocumento(page, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens);
         let finalPdfBuffer = resultadoFinal.buffer;
 
+        // =================================================================
+        // CORRECAO DA NUMERACAO GLOBAL DO RODAPE (so quando ha costura de
+        // segmentos em paisagem, que e quando a contagem nativa desvia)
+        // =================================================================
         if (resultadoFinal.temSegmentosPaisagem) {
             console.log("🔢 Corrigindo numeração global de páginas no rodapé...");
             finalPdfBuffer = await corrigirNumeracaoRodape(finalPdfBuffer);
         }
 
+        // =================================================================
+        // REALINHAMENTO DOS NUMEROS DO INDICE + CRIACAO DOS LINKS INTERNOS
+        // (roda sempre que houver indice com marcadores, independente de
+        // haver secao em paisagem ou nao - resolve o desalinhamento do
+        // numero mesmo quando o contentor externo, como o CabecalhoHTML
+        // do template Siemens-Energy, e desconhecido/opaco para a API)
+        // =================================================================
         if (Object.keys(mapaDestinos).length > 0) {
-            console.log("🔗 Criando links de navegação internos no índice...");
-            finalPdfBuffer = await adicionarLinksInternosDoIndice(finalPdfBuffer, mapaDestinos);
+            console.log("📐 Processando índice (realinhamento de margem + links)...");
+            const mLateralPt = mmParaPt(mLateral);
+            finalPdfBuffer = await processarIndice(finalPdfBuffer, mapaDestinos, mLateralPt);
         }
 
         console.log("🎉 PDF Finalizado e enviado ao Power Automate!");
