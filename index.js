@@ -14,10 +14,6 @@ const LANDSCAPE_END = '<!--LANDSCAPE_END-->';
 
 // =========================================================================
 // MARCADORES DE LOGO
-//
-// O Power Apps entrega apenas o Base64 CRU envolvido nesses marcadores.
-// E a API quem decide: como montar a tag <img>, qual tamanho usar, e
-// onde posicionar o cabecalho na pagina em paisagem.
 // =========================================================================
 const LOGO_ESQ_START = '<!--LOGO_ESQ-->';
 const LOGO_ESQ_END = '<!--/LOGO_ESQ-->';
@@ -87,27 +83,10 @@ function extrairEntreMarcadores(html, marcadorInicio, marcadorFim) {
 }
 
 // =========================================================================
-// HELPER (NOVO): detecta se o cabecalho recebido do Power Apps esta
-// "vazio" (ou seja, o template e Siemens-Energy, que envia <div></div>
-// porque o cabecalho real vive dentro do <thead> da wrapper-table).
-//
-// Quando o cabecalho tem conteudo real (templates como Axia, que usam
-// o headerTemplate nativo do Puppeteer), esta funcao retorna false -
-// e nesse caso NAO injetamos cabecalho manual no segmento em paisagem,
-// porque o headerTemplate ja se aplica automaticamente a TODAS as
-// paginas, incluindo a em paisagem.
-// =========================================================================
-function cabecalhoEstaVazio(headerHtmlProcessado) {
-    const semEspacos = headerHtmlProcessado.replace(/\s+/g, '').toLowerCase();
-    return semEspacos === '<div></div>' || semEspacos === '';
-}
-
-// =========================================================================
 // FUNCAO: injeta o cabecalho (logos) no topo de um segmento em paisagem.
-//
-// Usada APENAS quando o template e Siemens-Energy (cabecalho vazio vindo
-// da API). Nos demais templates (Axia, etc.) o headerTemplate nativo do
-// Puppeteer ja resolve isso sozinho, e esta funcao nao e chamada.
+// Usada apenas quando o template e Siemens-Energy (cabecalho vazio vindo
+// do Power Apps). Nos demais templates, o headerTemplate nativo do
+// Puppeteer ja cobre a pagina em paisagem automaticamente.
 // =========================================================================
 function injetarCabecalhoPaisagem(htmlSegmento) {
     let html = htmlSegmento;
@@ -127,13 +106,12 @@ function injetarCabecalhoPaisagem(htmlSegmento) {
 
     let imgEsq = '';
     if (base64Esq) {
-        imgEsq = '<img src="' + base64Esq + '" height="45" />';
+        imgEsq = '' + base64Esq + '';
     }
 
     let imgDir = '';
     if (base64Dir) {
-        imgDir = '<img src="' + base64Dir + '" height="45" />';
-    }
+        imgDir = '<img src="' + base64Dir }
 
     let cabecalhoHtml = '';
     cabecalhoHtml += '<table width="100%" cellspacing="0" cellpadding="0" ';
@@ -148,11 +126,8 @@ function injetarCabecalhoPaisagem(htmlSegmento) {
 }
 
 // =========================================================================
-// HELPER (NOVO): remove os marcadores de logo do HTML sem inserir nada
-// no lugar. Usado quando o template NAO e Siemens (cabecalho ja vem
-// pronto via headerTemplate nativo) - os marcadores e o Base64 cru que
-// o Power Apps sempre envia precisam ser limpos para nao aparecer como
-// texto solto na pagina renderizada.
+// HELPER: remove marcadores de logo sem inserir nada no lugar (usado
+// quando o template NAO e Siemens - o headerTemplate nativo ja resolve).
 // =========================================================================
 function removerMarcadoresDeLogo(html) {
     let resultado = html;
@@ -161,6 +136,87 @@ function removerMarcadoresDeLogo(html) {
     const logoDir = extrairEntreMarcadores(resultado, LOGO_DIR_START, LOGO_DIR_END);
     resultado = logoDir.htmlRestante;
     return resultado;
+}
+
+// =========================================================================
+// HELPER: detecta se o cabecalho recebido do Power Apps esta "vazio"
+// (template Siemens-Energy, que envia <div></div>).
+// =========================================================================
+function cabecalhoEstaVazio(headerHtmlProcessado) {
+    const semEspacos = headerHtmlProcessado.replace(/\s+/g, '').toLowerCase();
+    return semEspacos === '<div></div>' || semEspacos === '';
+}
+
+// =========================================================================
+// FUNCAO CENTRAL: renderiza um HTML completo em PDF, usando A MESMA logica
+// de segmentacao (retrato/paisagem) tanto para o PDF FANTASMA quanto para
+// o PDF FINAL.
+//
+// ISSO E CRITICO: antes, o PDF fantasma era renderizado como UM UNICO
+// documento continuo em retrato (sem separar a secao em paisagem), mas o
+// PDF final separava essa secao e a renderizava fisicamente em paisagem
+// (297mm), unindo depois com pdf-lib. Como a quantidade de paginas que a
+// tabela de IPs ocupa MUDA dependendo da orientacao/largura disponivel,
+// o FANTASMA contava um numero de paginas DIFERENTE do resultado real -
+// e todo o indice a partir dali saia desviado.
+//
+// Usando esta MESMA funcao para as duas passagens, a paginacao da secao
+// em paisagem fica IDENTICA nas duas - eliminando essa fonte de erro.
+// =========================================================================
+async function renderizarDocumento(page, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens) {
+    let temSegmentosPaisagem = false;
+    let bufferFinal;
+
+    if (!htmlContent.includes(LANDSCAPE_START)) {
+        const htmlLimpo = removerMarcadoresDeLogo(htmlContent);
+        await page.setContent(blocoGeometria + htmlLimpo, { waitUntil: 'networkidle0', timeout: 120000 });
+        bufferFinal = await page.pdf(pdfOptionsRetrato);
+
+    } else {
+        temSegmentosPaisagem = true;
+        const segmentos = dividirEmSegmentos(htmlContent);
+        const buffersGerados = [];
+
+        for (let i = 0; i < segmentos.length; i++) {
+            const seg = segmentos[i];
+
+            if (seg.tipo === 'retrato') {
+                if (seg.html.trim() === '') continue;
+
+                const htmlRetratoLimpo = removerMarcadoresDeLogo(seg.html);
+                await page.setContent(blocoGeometria + htmlRetratoLimpo, { waitUntil: 'networkidle0', timeout: 120000 });
+                const buf = await page.pdf(pdfOptionsRetrato);
+                buffersGerados.push(buf);
+
+            } else {
+                const conteudoComCabecalho = ehTemplateSiemens
+                    ? injetarCabecalhoPaisagem(seg.html)
+                    : removerMarcadoresDeLogo(seg.html);
+
+                let docPaisagem = '<!DOCTYPE html><html><head><meta charset="utf-8">';
+                docPaisagem += '<style>';
+                docPaisagem += 'html, body { margin: 0; padding: 0; }';
+                docPaisagem += 'table { max-width: 100% !important; }';
+                docPaisagem += 'th, td { overflow-wrap: break-word; word-wrap: break-word; }';
+                docPaisagem += '</style>';
+                docPaisagem += '</head><body>' + conteudoComCabecalho + '</body></html>';
+
+                await page.setContent(docPaisagem, { waitUntil: 'networkidle0', timeout: 120000 });
+                const buf = await page.pdf(pdfOptionsPaisagem);
+                buffersGerados.push(buf);
+            }
+        }
+
+        const pdfFinal = await PDFDocument.create();
+        for (const buf of buffersGerados) {
+            const src = await PDFDocument.load(buf);
+            const paginasCopiadas = await pdfFinal.copyPages(src, src.getPageIndices());
+            paginasCopiadas.forEach(function (p) { pdfFinal.addPage(p); });
+        }
+        bufferFinal = Buffer.from(await pdfFinal.save());
+    }
+
+    return { buffer: bufferFinal, temSegmentosPaisagem: temSegmentosPaisagem };
 }
 
 // =========================================================================
@@ -277,19 +333,7 @@ app.post('/gerar-pdf', async (req, res) => {
         const footerHtml = footerRaw.split('[MARGEM_LATERAL]').join(mLateral);
 
         // -----------------------------------------------------------------
-        // DETECCAO AUTOMATICA DE TEMPLATE (NOVO)
-        //
-        // Se o cabecalho recebido estiver vazio (<div></div>), o template
-        // e o Siemens-Energy - nesse caso o cabecalho real vive dentro do
-        // <thead> da wrapper-table, que o segmento em paisagem NAO herda
-        // (ele e renderizado como documento HTML separado). Por isso
-        // precisamos injetar manualmente os logos ali.
-        //
-        // Se o cabecalho vier com conteudo (Axia ou qualquer outro
-        // template), o headerTemplate nativo do Puppeteer ja se aplica
-        // automaticamente a TODAS as paginas - incluindo a em paisagem -
-        // entao NAO injetamos nada, apenas limpamos os marcadores de logo
-        // (que o Power Apps sempre envia, independente do template).
+        // DETECCAO AUTOMATICA DE TEMPLATE
         // -----------------------------------------------------------------
         const ehTemplateSiemens = cabecalhoEstaVazio(headerHtml);
         console.log('🏷️ Template detectado: ' + (ehTemplateSiemens ? 'Siemens-Energy (cabecalho manual necessário)' : 'Outro template (cabecalho nativo já cobre a página em paisagem)'));
@@ -337,14 +381,37 @@ app.post('/gerar-pdf', async (req, res) => {
         const page = await browser.newPage();
 
         // =================================================================
-        // MOTOR DE INDICE INTELIGENTE (TWO-PASS RENDERING)
+        // MOTOR DE INDICE INTELIGENTE (TWO-PASS RENDERING) - VERSAO ROBUSTA
+        //
+        // DUAS CORRECOES APLICADAS AQUI:
+        //
+        // 1) DUMMY DE LARGURA FIXA: no PDF fantasma, cada placeholder
+        //    {{PAG_CAP_X}} (que tem tamanhos de texto MUITO diferentes,
+        //    ex: 19 caracteres) e substituido por um numero fake de
+        //    EXATAMENTE 3 digitos ("000"). No PDF final, o numero real
+        //    tambem e formatado com ZERO A ESQUERDA ate 3 digitos
+        //    (ex: "005", "012", "127"). Como o TEXTO tem o MESMO
+        //    COMPRIMENTO EM CARACTERES nas duas passagens, a largura
+        //    renderizada fica identica por construcao - nao depende mais
+        //    de nenhum comportamento especifico de CSS/navegador.
+        //
+        // 2) MESMO MOTOR DE RENDERIZACAO: o PDF fantasma agora usa a
+        //    MESMA funcao renderizarDocumento() que separa e renderiza a
+        //    secao em paisagem fisicamente (297mm) - exatamente como o
+        //    PDF final faz. Antes, o fantasma renderizava tudo em retrato
+        //    continuo, entao a tabela de IPs ocupava uma quantidade de
+        //    paginas DIFERENTE no calculo vs no resultado real. Agora as
+        //    duas passagens usam o MESMO caminho de codigo, garantindo
+        //    paginacao identica.
         // =================================================================
         if (htmlContent.includes('#ANC_')) {
-            console.log("🔍 Âncoras detectadas! Iniciando motor de índice...");
+            console.log("🔍 Âncoras detectadas! Iniciando motor de índice (versão robusta)...");
 
-            await page.setContent(blocoGeometria + htmlContent, { waitUntil: 'networkidle0', timeout: 120000 });
-            const ghostPdfBuffer = await page.pdf(pdfOptionsRetrato);
-            console.log("👻 PDF Fantasma gerado.");
+            const htmlFantasma = htmlContent.replace(/\{\{PAG_CAP_[A-Za-z0-9_]+\}\}/g, '000');
+
+            const resultadoFantasma = await renderizarDocumento(page, htmlFantasma, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens);
+            const ghostPdfBuffer = resultadoFantasma.buffer;
+            console.log("👻 PDF Fantasma gerado (mesmo motor de renderização do PDF final).");
 
             const pdfData = await pdfParse(ghostPdfBuffer, { pagerender: render_page });
             const pages = pdfData.text.split('\n---PAGE_BREAK---\n');
@@ -368,8 +435,9 @@ app.post('/gerar-pdf', async (req, res) => {
                     const placeholder = anchor.replace('#ANC_', '{{PAG_').replace('#', '}}');
 
                     if (pageNum > 0) {
-                        console.log('✅ Âncora ' + anchor + ' -> Página ' + pageNum);
-                        htmlContent = htmlContent.split(placeholder).join(pageNum);
+                        const pageNumFormatado = String(pageNum).padStart(3, '0');
+                        console.log('✅ Âncora ' + anchor + ' -> Página ' + pageNum + ' (exibido como "' + pageNumFormatado + '")');
+                        htmlContent = htmlContent.split(placeholder).join(pageNumFormatado);
                     } else {
                         console.log('❌ Âncora ' + anchor + ' não encontrada. Placeholder será limpo.');
                     }
@@ -383,7 +451,7 @@ app.post('/gerar-pdf', async (req, res) => {
                 const orfaosUnicos = [...new Set(orfaos)];
                 console.log('🧹 Limpando ' + orfaosUnicos.length + ' placeholder(s) órfão(s):', orfaosUnicos);
                 orfaosUnicos.forEach(function (o) {
-                    htmlContent = htmlContent.split(o).join('-');
+                    htmlContent = htmlContent.split(o).join('---');
                 });
             }
 
@@ -392,83 +460,16 @@ app.post('/gerar-pdf', async (req, res) => {
         }
 
         // =================================================================
-        // IMPRESSAO FINAL
+        // IMPRESSAO FINAL - usa a MESMA funcao do PDF fantasma
         // =================================================================
-        let finalPdfBuffer;
-        let temSegmentosPaisagem = false;
-
-        if (!htmlContent.includes(LANDSCAPE_START)) {
-            console.log("🖨️ Imprimindo PDF Final (documento único, sem seções em paisagem)...");
-            // Mesmo sem paisagem, os marcadores de logo podem existir no
-            // corpo (caso algum capitulo os inclua por engano) - limpamos
-            // por seguranca antes de imprimir.
-            htmlContent = removerMarcadoresDeLogo(htmlContent);
-            await page.setContent(blocoGeometria + htmlContent, { waitUntil: 'networkidle0', timeout: 120000 });
-            finalPdfBuffer = await page.pdf(pdfOptionsRetrato);
-
-        } else {
-            temSegmentosPaisagem = true;
-            console.log("🖨️ Documento contém seção(ões) em paisagem. Renderizando em partes separadas...");
-            const segmentos = dividirEmSegmentos(htmlContent);
-            const buffersGerados = [];
-
-            for (let i = 0; i < segmentos.length; i++) {
-                const seg = segmentos[i];
-
-                if (seg.tipo === 'retrato') {
-                    if (seg.html.trim() === '') continue;
-
-                    console.log('   📄 Renderizando segmento ' + (i + 1) + '/' + segmentos.length + ' (retrato)...');
-                    const htmlRetratoLimpo = removerMarcadoresDeLogo(seg.html);
-                    await page.setContent(blocoGeometria + htmlRetratoLimpo, { waitUntil: 'networkidle0', timeout: 120000 });
-                    const buf = await page.pdf(pdfOptionsRetrato);
-                    buffersGerados.push(buf);
-
-                } else {
-                    console.log('   📄 Renderizando segmento ' + (i + 1) + '/' + segmentos.length + ' (PAISAGEM)...');
-
-                    // -----------------------------------------------------
-                    // NOVO: so injeta o cabecalho manual se o template for
-                    // Siemens-Energy. Nos demais templates (Axia, etc.), o
-                    // headerTemplate nativo do Puppeteer ja cobre a pagina
-                    // em paisagem automaticamente - so removemos os
-                    // marcadores de logo (que sempre chegam do Power Apps)
-                    // sem inserir nada no lugar deles.
-                    // -----------------------------------------------------
-                    const conteudoComCabecalho = ehTemplateSiemens
-                        ? injetarCabecalhoPaisagem(seg.html)
-                        : removerMarcadoresDeLogo(seg.html);
-
-                    let docPaisagem = '<!DOCTYPE html><html><head><meta charset="utf-8">';
-                    docPaisagem += '<style>';
-                    docPaisagem += 'html, body { margin: 0; padding: 0; }';
-                    docPaisagem += 'table { max-width: 100% !important; }';
-                    docPaisagem += 'th, td { overflow-wrap: break-word; word-wrap: break-word; }';
-                    docPaisagem += '</style>';
-                    docPaisagem += '</head><body>' + conteudoComCabecalho + '</body></html>';
-
-                    await page.setContent(docPaisagem, { waitUntil: 'networkidle0', timeout: 120000 });
-                    const buf = await page.pdf(pdfOptionsPaisagem);
-                    buffersGerados.push(buf);
-                }
-            }
-
-            console.log("🔗 Unindo os segmentos em um único PDF final...");
-            const pdfFinal = await PDFDocument.create();
-
-            for (const buf of buffersGerados) {
-                const src = await PDFDocument.load(buf);
-                const paginasCopiadas = await pdfFinal.copyPages(src, src.getPageIndices());
-                paginasCopiadas.forEach(function (p) { pdfFinal.addPage(p); });
-            }
-
-            finalPdfBuffer = Buffer.from(await pdfFinal.save());
-        }
+        console.log("🖨️ Imprimindo PDF Final...");
+        const resultadoFinal = await renderizarDocumento(page, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens);
+        let finalPdfBuffer = resultadoFinal.buffer;
 
         // =================================================================
         // CORRECAO DA NUMERACAO GLOBAL DO RODAPE
         // =================================================================
-        if (temSegmentosPaisagem) {
+        if (resultadoFinal.temSegmentosPaisagem) {
             console.log("🔢 Corrigindo numeração global de páginas no rodapé...");
             finalPdfBuffer = await corrigirNumeracaoRodape(finalPdfBuffer);
         }
