@@ -292,26 +292,17 @@ async function corrigirNumeracaoRodape(pdfBuffer) {
 }
 
 // =========================================================================
-// FUNCAO UNIFICADA: realinha os numeros do indice à margem REAL da pagina
-// (independente de qualquer CSS/contentor externo desconhecido, como o
-// CabecalhoHTML do template Siemens-Energy) E cria os links de navegacao
-// internos, tudo numa unica passagem sobre o PDF final.
+// FUNCAO UNIFICADA: realinha os numeros do indice a margem REAL da pagina,
+// ESTENDE o pontilhado ate a nova posicao (fecha o gap deixado pelo
+// deslocamento) e cria os links de navegacao internos - tudo numa unica
+// passagem sobre o PDF final.
 //
-// POR QUE ISSO ERA NECESSARIO (causa raiz real, agora identificada):
-// No template Siemens-Energy, o botao (btn_Controle_7 / btn_Controle_14)
-// usa varCorpoInicial = varCabecalhoPronto quando o template e
-// Siemens-Energy - ou seja, NENHUMA das classes CSS (.pagina-a4,
-// .wrapper-table) e sequer aplicada nesse caminho. O contentor real que
-// envolve o indice vem do campo CabecalhoHTML armazenado no SharePoint,
-// um conteudo totalmente opaco para quem edita apenas os controles
-// html_IndiceX. Por isso nenhum ajuste de CSS dentro do indice conseguia
-// garantir alinhamento correto com a margem real da pagina.
-//
-// SOLUCAO: em vez de tentar adivinhar o CSS externo, a API agora
-// reposiciona os numeros DIRETAMENTE no PDF ja gerado, calculando a
-// margem real a partir da largura da pagina e do parametro mLateral
-// (que a propria API ja conhece com precisao) - 100% deterministico,
-// independente de qualquer contentor externo.
+// NOVO NESTA VERSAO: apos mover o numero para a margem real, o pontilhado
+// (.toc-dots) desenhado pelo Chromium ainda termina na posicao ANTIGA do
+// numero (calculada com base no contentor externo desconhecido). Isso
+// deixava um vao vazio entre o fim dos pontinhos e o numero reposicionado.
+// Agora a API desenha pontinhos ADICIONAIS cobrindo exatamente esse vao,
+// na mesma altura da linha pontilhada original, fechando o gap.
 // =========================================================================
 async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
     const pagesItems = [];
@@ -382,8 +373,14 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
     const BUFFER_MARGEM = 2; // pt de folga entre o numero e a margem real
     const LARGURA_LINK_PADRAO = 34; // usado como fallback se nao achar o numero
 
+    // Parametros da extensao do pontilhado (para fechar o gap)
+    const DOT_RAIO = 0.6; // pt - raio de cada pontinho desenhado
+    const DOT_ESPACAMENTO = 4; // pt - distancia entre centros dos pontinhos
+    const DOT_COR = rgb(0, 0, 0);
+
     let realinhados = 0;
     let linksCriados = 0;
+    let pontosEstendidos = 0;
 
     ocorrencias.forEach(function (oc) {
         const destPageNum = mapaDestinos[oc.codigo];
@@ -409,8 +406,8 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
             if (Math.abs(delta) > 0.5) {
                 // Deteccao de negrito: capitulos principais (ex: "2_1",
                 // "3_1") tem 1 underscore no codigo; subitens (ex: "2_1_1",
-                // "3_2_2_1") tem 2 ou mais - e o mesmo padrao usado na
-                // montagem visual do indice (linhas principais em negrito).
+                // "3_2_2_1") tem 2 ou mais - mesmo padrao usado na montagem
+                // visual do indice (linhas principais em negrito).
                 const numUnderscores = (oc.codigo.match(/_/g) || []).length;
                 const ehNegrito = numUnderscores === 1;
                 const fonteEscolhida = ehNegrito ? fonteBold : fonteNormal;
@@ -434,6 +431,31 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
                 });
 
                 realinhados++;
+
+                // ---------------------------------------------------------
+                // NOVO: ESTENDE O PONTILHADO ate a nova posicao do numero,
+                // fechando o gap deixado pelo deslocamento. Os pontinhos do
+                // Chromium (.toc-dots) terminavam na posicao ANTIGA do
+                // numero (numItem.x); desenhamos pontinhos adicionais desse
+                // ponto ate a nova posicao (numItem.x + delta), na mesma
+                // altura aproximada da linha pontilhada original (um pouco
+                // abaixo da base do texto, imitando um border-bottom).
+                // ---------------------------------------------------------
+                if (delta > 0) {
+                    const dotY = numItem.y - 1.5; // logo abaixo da base do texto
+                    const inicioGap = numItem.x - 2; // onde os pontinhos originais paravam
+                    const fimGap = numItem.x + delta - 2; // um pouco antes do numero novo
+
+                    for (let px = inicioGap; px < fimGap; px += DOT_ESPACAMENTO) {
+                        paginaOrigem.drawCircle({
+                            x: px,
+                            y: dotY,
+                            size: DOT_RAIO,
+                            color: DOT_COR
+                        });
+                        pontosEstendidos++;
+                    }
+                }
             }
 
             // Area do link cobre EXATAMENTE a caixa do numero na posicao
@@ -441,8 +463,7 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
             // marcador antigo aqui - como o numero pode se deslocar bastante
             // para alcancar a margem real, o marcador (que nao se move)
             // pode ficar a ESQUERDA do numero reposicionado, gerando um
-            // retangulo invertido (x0>x1) e um link invalido. Confirmado
-            // com teste isolado antes desta correcao.
+            // retangulo invertido (x0>x1) e um link invalido.
             const novoX = numItem.x + delta;
             rectX0 = Math.max(0, novoX - 2);
             rectX1 = novoX + numItem.width + 2;
@@ -485,6 +506,7 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
     });
 
     console.log('📐 ' + realinhados + ' número(s) de índice realinhado(s) à margem real da página.');
+    console.log('⋯ ' + pontosEstendidos + ' pontinho(s) desenhado(s) para fechar o gap do pontilhado.');
     console.log('🔗 Total: ' + linksCriados + ' link(s) de navegação criado(s) no índice.');
 
     return Buffer.from(await pdfDoc.save());
@@ -647,14 +669,12 @@ app.post('/gerar-pdf', async (req, res) => {
         }
 
         // =================================================================
-        // REALINHAMENTO DOS NUMEROS DO INDICE + CRIACAO DOS LINKS INTERNOS
-        // (roda sempre que houver indice com marcadores, independente de
-        // haver secao em paisagem ou nao - resolve o desalinhamento do
-        // numero mesmo quando o contentor externo, como o CabecalhoHTML
-        // do template Siemens-Energy, e desconhecido/opaco para a API)
+        // REALINHAMENTO DOS NUMEROS DO INDICE + EXTENSAO DO PONTILHADO +
+        // CRIACAO DOS LINKS INTERNOS (roda sempre que houver indice com
+        // marcadores, independente de haver secao em paisagem ou nao)
         // =================================================================
         if (Object.keys(mapaDestinos).length > 0) {
-            console.log("📐 Processando índice (realinhamento de margem + links)...");
+            console.log("📐 Processando índice (realinhamento + pontilhado + links)...");
             const mLateralPt = mmParaPt(mLateral);
             finalPdfBuffer = await processarIndice(finalPdfBuffer, mapaDestinos, mLateralPt);
         }
