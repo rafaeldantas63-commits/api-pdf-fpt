@@ -1,7 +1,7 @@
 FROM node:18-alpine
 
 # Instala o Chromium e todas as dependências nativas para rodar sem travar.
-#
+##
 # CORRIGIDO (auditoria item #7): removidas as entradas "nodejs" e "npm"
 # desta lista. A imagem base "node:18-alpine" JA vem com Node.js e npm
 # instalados na versão correta (18.x). Reinstalar "nodejs"/"npm" via apk
