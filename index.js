@@ -13,6 +13,31 @@ const LOGO_ESQ_END = '<!--/LOGO_ESQ-->';
 const LOGO_DIR_START = '<!--LOGO_DIR-->';
 const LOGO_DIR_END = '<!--/LOGO_DIR-->';
 
+// =========================================================================
+// LOGGER DE PROGRESSO (novo)
+//
+// Definido no escopo do MODULO (nao dentro do handler) para que a funcao
+// renderizarDocumento() tambem consiga chamar o log, mostrando o avanco
+// segmento a segmento.
+//
+// O cronometro (_t0) e reiniciado no inicio de cada requisicao pela
+// funcao iniciarCronometro(), chamada dentro do POST /gerar-pdf.
+//
+// Como usar: no Render, abra o servico -> aba "Logs". As mensagens
+// aparecem em tempo real com o tempo decorrido desde o inicio da
+// requisicao, permitindo identificar exatamente qual etapa esta lenta.
+// =========================================================================
+let _t0 = Date.now();
+
+function iniciarCronometro() {
+    _t0 = Date.now();
+}
+
+function log(etapa) {
+    const seg = ((Date.now() - _t0) / 1000).toFixed(1);
+    console.log('[' + seg + 's] ' + etapa);
+}
+
 function mmParaPt(valorStr) {
     if (!valorStr) return 0;
     const numero = parseFloat(String(valorStr).replace(',', '.'));
@@ -90,27 +115,38 @@ async function renderizarDocumento(page, htmlContent, blocoGeometria, pdfOptions
     let bufferFinal;
 
     if (!htmlContent.includes(LANDSCAPE_START)) {
+        log('    documento unico (sem paisagem) - carregando HTML no navegador...');
         const htmlLimpo = removerMarcadoresDeLogo(htmlContent);
         await page.setContent(blocoGeometria + htmlLimpo, { waitUntil: 'networkidle0', timeout: 120000 });
+        log('    HTML carregado - imprimindo PDF...');
         bufferFinal = await page.pdf(pdfOptionsRetrato);
+        log('    PDF impresso');
     } else {
         temSegmentosPaisagem = true;
         const segmentos = dividirEmSegmentos(htmlContent);
+        log('    documento com ' + segmentos.length + ' segmento(s) (retrato/paisagem)');
         const buffersGerados = [];
         for (let i = 0; i < segmentos.length; i++) {
             const seg = segmentos[i];
             if (seg.tipo === 'retrato') {
                 if (seg.html.trim() === '') continue;
+                log('    segmento ' + (i + 1) + '/' + segmentos.length + ' (retrato) - carregando...');
                 const htmlRetratoLimpo = removerMarcadoresDeLogo(seg.html);
                 await page.setContent(blocoGeometria + htmlRetratoLimpo, { waitUntil: 'networkidle0', timeout: 120000 });
+                log('    segmento ' + (i + 1) + '/' + segmentos.length + ' (retrato) - imprimindo...');
                 buffersGerados.push(await page.pdf(pdfOptionsRetrato));
+                log('    segmento ' + (i + 1) + '/' + segmentos.length + ' (retrato) OK');
             } else {
+                log('    segmento ' + (i + 1) + '/' + segmentos.length + ' (paisagem) - carregando...');
                 const conteudoComCabecalho = ehTemplateSiemens ? injetarCabecalhoPaisagem(seg.html) : removerMarcadoresDeLogo(seg.html);
                 let docPaisagem = '<!DOCTYPE html><html><head><meta charset="utf-8"><style>html, body { margin: 0; padding: 0; } table { max-width: 100% !important; } th, td { overflow-wrap: break-word; word-wrap: break-word; }</style></head><body>' + conteudoComCabecalho + '</body></html>';
                 await page.setContent(docPaisagem, { waitUntil: 'networkidle0', timeout: 120000 });
+                log('    segmento ' + (i + 1) + '/' + segmentos.length + ' (paisagem) - imprimindo...');
                 buffersGerados.push(await page.pdf(pdfOptionsPaisagem));
+                log('    segmento ' + (i + 1) + '/' + segmentos.length + ' (paisagem) OK');
             }
         }
+        log('    juntando ' + buffersGerados.length + ' buffer(s) em um PDF unico...');
         const pdfFinal = await PDFDocument.create();
         for (const buf of buffersGerados) {
             const src = await PDFDocument.load(buf);
@@ -118,6 +154,7 @@ async function renderizarDocumento(page, htmlContent, blocoGeometria, pdfOptions
             paginasCopiadas.forEach(function (p) { pdfFinal.addPage(p); });
         }
         bufferFinal = Buffer.from(await pdfFinal.save());
+        log('    PDF unico montado');
     }
     return { buffer: bufferFinal, temSegmentosPaisagem: temSegmentosPaisagem };
 }
@@ -248,6 +285,7 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
         if (oc.numItem && oc.titleEndX !== null) {
             const numItem = oc.numItem;
             const novoX = targetRightX - numItem.width;
+
             const numUnderscores = (oc.codigo.match(/_/g) || []).length;
             const fonteEscolhida = (numUnderscores === 1) ? fonteBold : fonteNormal;
 
@@ -339,12 +377,20 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
 
 app.post('/gerar-pdf', async (req, res) => {
     let browser;
+
+    // Reinicia o cronometro a cada requisicao
+    iniciarCronometro();
+    log('===== NOVA REQUISICAO RECEBIDA =====');
+
     try {
         if (!req.body || typeof req.body.html !== 'string' || req.body.html.trim() === '') {
+            log('ERRO: campo html ausente ou vazio');
             return res.status(400).json({ erro: "O campo 'html' é obrigatório e deve ser um texto não vazio." });
         }
 
         let htmlContent = req.body.html;
+        log('HTML recebido: ' + (htmlContent.length / 1024).toFixed(0) + ' KB');
+
         const headerRaw = req.body.cabecalho || '<div></div>';
         const footerRaw = req.body.rodape || '<div></div>';
         const mTop = req.body.margemTop || '10mm';
@@ -377,25 +423,34 @@ app.post('/gerar-pdf', async (req, res) => {
             timeout: 120000
         };
 
+        log('Iniciando navegador (Puppeteer)...');
         browser = await puppeteer.launch({
             headless: 'new',
             executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-zygote']
         });
+        log('Navegador iniciado');
 
         const page = await browser.newPage();
         const mapaDestinos = {};
 
         if (htmlContent.includes('#ANC_')) {
+            log('ETAPA 1/5 - Renderizando PDF fantasma (para calcular as paginas do indice)...');
             const htmlFantasma = htmlContent.replace(/\{\{PAG_CAP_[A-Za-z0-9_]+\}\}/g, '000');
             const resultadoFantasma = await renderizarDocumento(page, htmlFantasma, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens);
+            log('ETAPA 1/5 - PDF fantasma pronto');
+
+            log('ETAPA 2/5 - Extraindo texto do PDF fantasma (pdf-parse)...');
             const pdfData = await pdfParse(resultadoFantasma.buffer, { pagerender: render_page });
             const pages = pdfData.text.split('\n---PAGE_BREAK---\n');
+            log('ETAPA 2/5 - Texto extraido de ' + pages.length + ' pagina(s)');
+
             const pagesNormalizadas = pages.map(function (p) { return normalizarAncora(p); });
             const anchors = htmlContent.match(/#ANC_[A-Za-z0-9_]+#/g);
 
             if (anchors) {
                 const uniqueAnchors = [...new Set(anchors)];
+                log('Mapeando ' + uniqueAnchors.length + ' ancora(s) unica(s)...');
                 uniqueAnchors.forEach(function (anchor) {
                     const pureAnchor = normalizarAncora(anchor);
                     const pageNum = pagesNormalizadas.findIndex(function (pText) { return pText.includes(pureAnchor); }) + 1;
@@ -408,36 +463,57 @@ app.post('/gerar-pdf', async (req, res) => {
                         const marcadorHtml = '<span style="color:#ffffff;font-size:9pt;">' + marcador + '</span>';
                         htmlContent = htmlContent.split(placeholder).join(pageNumFormatado + marcadorHtml);
                         mapaDestinos[codigo] = pageNum;
+                    } else {
+                        log('  AVISO: ancora ' + codigo + ' NAO encontrada no PDF (vai sair como ---)');
                     }
                     htmlContent = htmlContent.split(anchor).join('');
                 });
+                log('Ancoras mapeadas: ' + Object.keys(mapaDestinos).length + ' de ' + uniqueAnchors.length);
             }
 
             const orfaos = htmlContent.match(/\{\{PAG_[A-Za-z0-9_]+\}\}/g);
             if (orfaos) {
-                [...new Set(orfaos)].forEach(function (o) { htmlContent = htmlContent.split(o).join('---'); });
+                const listaOrfaos = [...new Set(orfaos)];
+                log('Substituindo ' + listaOrfaos.length + ' placeholder(s) orfao(s) por "---"');
+                listaOrfaos.forEach(function (o) { htmlContent = htmlContent.split(o).join('---'); });
             }
         }
 
+        log('ETAPA 3/5 - Renderizando PDF final...');
         const resultadoFinal = await renderizarDocumento(page, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens);
         let finalPdfBuffer = resultadoFinal.buffer;
+        log('ETAPA 3/5 - PDF final pronto (' + (finalPdfBuffer.length / 1024 / 1024).toFixed(1) + ' MB)');
 
         if (resultadoFinal.temSegmentosPaisagem) {
+            log('ETAPA 4/5 - Corrigindo numeracao do rodape...');
             finalPdfBuffer = await corrigirNumeracaoRodape(finalPdfBuffer);
+            log('ETAPA 4/5 - Numeracao corrigida');
+        } else {
+            log('ETAPA 4/5 - Pulada (documento sem segmentos em paisagem)');
         }
 
         if (Object.keys(mapaDestinos).length > 0) {
+            log('ETAPA 5/5 - Processando indice (alinhamento, pontilhado e links)...');
             const mLateralPt = mmParaPt(mLateral);
             finalPdfBuffer = await processarIndice(finalPdfBuffer, mapaDestinos, mLateralPt);
+            log('ETAPA 5/5 - Indice processado');
+        } else {
+            log('ETAPA 5/5 - Pulada (nenhuma ancora mapeada)');
         }
 
+        log('Convertendo para base64 e enviando resposta...');
         res.json({ pdfBase64: finalPdfBuffer.toString('base64') });
+        log('===== CONCLUIDO COM SUCESSO =====');
 
     } catch (error) {
+        log('===== ERRO FATAL =====');
         console.error("🚨 Erro Fatal:", error);
         res.status(500).json({ erro: error.toString() });
     } finally {
-        if (browser) await browser.close();
+        if (browser) {
+            await browser.close();
+            log('Navegador fechado');
+        }
     }
 });
 
