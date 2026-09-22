@@ -16,13 +16,30 @@ const LOGO_ESQ_END = '<!--/LOGO_ESQ-->';
 const LOGO_DIR_START = '<!--LOGO_DIR-->';
 const LOGO_DIR_END = '<!--/LOGO_DIR-->';
 
-// ==========================================================================
-// LOGGER DE PROGRESSO + MEDIDOR DE MEMORIA
+// =========================================================================
+// OTIMIZACAO DE TEMPO - ESTRATEGIA DE ESPERA DO PUPPETEER
 //
-// O log agora mostra tambem o consumo de RAM (RSS) a cada etapa. Isso
-// permite ver, no painel de Logs do Render, exatamente em que ponto a
-// memoria dispara - util porque o plano basico tem limite baixo e o
-// processo e morto sem mensagem de erro quando estoura.
+// ANTES: waitUntil: 'networkidle0'
+//   Essa opcao faz o Puppeteer esperar a rede ficar COMPLETAMENTE ociosa
+//   (zero conexoes ativas) por 500ms ANTES de considerar a pagina pronta.
+//   Faz sentido em paginas que baixam imagens, fontes ou dados via AJAX.
+//
+// AGORA: waitUntil: 'domcontentloaded'
+//   O HTML gerado pelo Power Apps e 100% AUTOCONTIDO: todo o conteudo vem
+//   embutido na string (inclusive as imagens, que sao base64 inline). Nao
+//   ha NENHUMA requisicao de rede a ser aguardada. Portanto, o
+//   'networkidle0' estava apenas cobrando um pedagio de ~500ms a 2s por
+//   chamada, sem beneficio algum.
+//
+//   Como sao 6 chamadas por requisicao (3 segmentos no PDF fantasma + 3
+//   no PDF final), a economia estimada fica entre 3 e 12 segundos - o
+//   suficiente para tentar trazer o total abaixo do teto de 120s imposto
+//   pelo conector HTTP do Power Automate.
+// =========================================================================
+const ESPERA_RENDER = 'domcontentloaded';
+
+// =========================================================================
+// LOGGER DE PROGRESSO + MEDIDOR DE MEMORIA
 // =========================================================================
 let _t0 = Date.now();
 
@@ -120,22 +137,16 @@ function cabecalhoEstaVazio(headerHtmlProcessado) {
 }
 
 // =========================================================================
-// RENDERIZACAO - OTIMIZADA PARA BAIXO CONSUMO DE MEMORIA
-//
-// TRES MUDANCAS EM RELACAO A VERSAO ANTERIOR:
+// RENDERIZACAO - OTIMIZADA PARA BAIXO CONSUMO DE MEMORIA E TEMPO
 //
 // 1) UMA ABA (page) POR SEGMENTO, FECHADA LOGO APOS O USO.
-//    Antes, a mesma aba era reaproveitada para todos os segmentos. O
-//    Chromium mantem em memoria o layout/render tree da pagina anterior,
-//    entao ao chegar no segmento mais pesado a RAM ja estava ocupada
-//    pelos anteriores. Fechando a aba, esse espaco e devolvido ao SO.
+//    O Chromium mantem em memoria o layout da pagina anterior; fechando
+//    a aba, esse espaco e devolvido ao SO.
 //
 // 2) BUFFERS GRAVADOS EM DISCO (/tmp), NAO ACUMULADOS EM RAM.
-//    Antes, todos os PDFs parciais ficavam num array em memoria ate o
-//    final. Agora cada um vai para um arquivo temporario e so e lido de
-//    volta no momento exato da juncao, um por vez.
 //
-// 3) RECEBE O BROWSER (nao a page), pois agora cria/fecha abas sozinha.
+// 3) waitUntil: ESPERA_RENDER ('domcontentloaded') em vez de
+//    'networkidle0' - ver explicacao no topo do arquivo.
 // =========================================================================
 async function renderizarDocumento(browser, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens, prefixoTmp) {
     let temSegmentosPaisagem = false;
@@ -146,7 +157,7 @@ async function renderizarDocumento(browser, htmlContent, blocoGeometria, pdfOpti
         const page = await browser.newPage();
         try {
             const htmlLimpo = removerMarcadoresDeLogo(htmlContent);
-            await page.setContent(blocoGeometria + htmlLimpo, { waitUntil: 'networkidle0', timeout: 120000 });
+            await page.setContent(blocoGeometria + htmlLimpo, { waitUntil: ESPERA_RENDER, timeout: 120000 });
             log('    HTML carregado - imprimindo PDF...');
             bufferFinal = await page.pdf(pdfOptionsRetrato);
             log('    PDF impresso');
@@ -177,14 +188,14 @@ async function renderizarDocumento(browser, htmlContent, blocoGeometria, pdfOpti
                 if (seg.tipo === 'retrato') {
                     log('    ' + rotulo + ' - carregando...');
                     const htmlRetratoLimpo = removerMarcadoresDeLogo(seg.html);
-                    await page.setContent(blocoGeometria + htmlRetratoLimpo, { waitUntil: 'networkidle0', timeout: 120000 });
+                    await page.setContent(blocoGeometria + htmlRetratoLimpo, { waitUntil: ESPERA_RENDER, timeout: 120000 });
                     log('    ' + rotulo + ' - imprimindo...');
                     buffer = await page.pdf(pdfOptionsRetrato);
                 } else {
                     log('    ' + rotulo + ' - carregando...');
                     const conteudoComCabecalho = ehTemplateSiemens ? injetarCabecalhoPaisagem(seg.html) : removerMarcadoresDeLogo(seg.html);
                     let docPaisagem = '<!DOCTYPE html><html><head><meta charset="utf-8"><style>html, body { margin: 0; padding: 0; } table { max-width: 100% !important; } th, td { overflow-wrap: break-word; word-wrap: break-word; }</style></head><body>' + conteudoComCabecalho + '</body></html>';
-                    await page.setContent(docPaisagem, { waitUntil: 'networkidle0', timeout: 120000 });
+                    await page.setContent(docPaisagem, { waitUntil: ESPERA_RENDER, timeout: 120000 });
                     log('    ' + rotulo + ' - imprimindo...');
                     buffer = await page.pdf(pdfOptionsPaisagem);
                 }
@@ -226,23 +237,9 @@ async function renderizarDocumento(browser, htmlContent, blocoGeometria, pdfOpti
 // =========================================================================
 // POS-PROCESSAMENTO UNIFICADO (rodape + indice)
 //
-// MUDANCA IMPORTANTE: antes existiam duas funcoes independentes
-// (corrigirNumeracaoRodape e processarIndice), e CADA UMA fazia:
-//   - um pdfParse completo do documento (le todas as paginas)
-//   - um PDFDocument.load() completo
-//   - um PDFDocument.save() completo
-//
-// Ou seja, o PDF inteiro era carregado e reserializado DUAS vezes em
-// sequencia, dobrando o pico de memoria justamente no fim do processo.
-//
-// Agora e UMA leitura (pdfParse), UM load e UM save, com as duas
-// correcoes aplicadas no mesmo documento em memoria. A ordem das
-// operacoes de desenho e identica a anterior (rodape primeiro, indice
-// depois) - o resultado visual e exatamente o mesmo.
-//
-// Obs.: o reposicionamento do indice nao depende do rodape, e o rodape
-// nao altera a posicao dos itens do indice, entao ler as posicoes uma
-// unica vez (antes das duas correcoes) e seguro.
+// Uma unica leitura (pdfParse), um load e um save, com as duas correcoes
+// aplicadas no mesmo documento em memoria. A ordem das operacoes de
+// desenho e identica a anterior (rodape primeiro, indice depois).
 // =========================================================================
 async function posProcessarPDF(pdfBuffer, mapaDestinos, mLateralPt, corrigirRodape) {
     const pagesItems = [];
@@ -540,8 +537,7 @@ app.post('/gerar-pdf', async (req, res) => {
             const pdfData = await pdfParse(resultadoFantasma.buffer, { pagerender: render_page });
 
             // Solta o PDF fantasma da memoria IMEDIATAMENTE apos extrair o
-            // texto - ele nao e mais necessario e ocupava espaco durante
-            // toda a renderizacao final na versao anterior.
+            // texto - ele nao e mais necessario.
             resultadoFantasma.buffer = null;
             liberarMemoria();
 
