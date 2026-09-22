@@ -16,7 +16,7 @@ const LOGO_ESQ_END = '<!--/LOGO_ESQ-->';
 const LOGO_DIR_START = '<!--LOGO_DIR-->';
 const LOGO_DIR_END = '<!--/LOGO_DIR-->';
 
-// =========================================================================
+// ==========================================================================
 // LOGGER DE PROGRESSO + MEDIDOR DE MEMORIA
 //
 // O log agora mostra tambem o consumo de RAM (RSS) a cada etapa. Isso
