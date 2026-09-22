@@ -2,6 +2,9 @@ const express = require('express');
 const puppeteer = require('puppeteer');
 const pdfParse = require('pdf-parse');
 const { PDFDocument, StandardFonts, rgb, PDFName } = require('pdf-lib');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -14,18 +17,12 @@ const LOGO_DIR_START = '<!--LOGO_DIR-->';
 const LOGO_DIR_END = '<!--/LOGO_DIR-->';
 
 // =========================================================================
-// LOGGER DE PROGRESSO (novo)
+// LOGGER DE PROGRESSO + MEDIDOR DE MEMORIA
 //
-// Definido no escopo do MODULO (nao dentro do handler) para que a funcao
-// renderizarDocumento() tambem consiga chamar o log, mostrando o avanco
-// segmento a segmento.
-//
-// O cronometro (_t0) e reiniciado no inicio de cada requisicao pela
-// funcao iniciarCronometro(), chamada dentro do POST /gerar-pdf.
-//
-// Como usar: no Render, abra o servico -> aba "Logs". As mensagens
-// aparecem em tempo real com o tempo decorrido desde o inicio da
-// requisicao, permitindo identificar exatamente qual etapa esta lenta.
+// O log agora mostra tambem o consumo de RAM (RSS) a cada etapa. Isso
+// permite ver, no painel de Logs do Render, exatamente em que ponto a
+// memoria dispara - util porque o plano basico tem limite baixo e o
+// processo e morto sem mensagem de erro quando estoura.
 // =========================================================================
 let _t0 = Date.now();
 
@@ -33,9 +30,21 @@ function iniciarCronometro() {
     _t0 = Date.now();
 }
 
+function mem() {
+    return (process.memoryUsage().rss / 1024 / 1024).toFixed(0);
+}
+
 function log(etapa) {
     const seg = ((Date.now() - _t0) / 1000).toFixed(1);
-    console.log('[' + seg + 's] ' + etapa);
+    console.log('[' + seg + 's | ' + mem() + 'MB] ' + etapa);
+}
+
+// Sugere coleta de lixo (so funciona se o Node rodar com --expose-gc).
+// Sem a flag, a chamada e ignorada silenciosamente - nao quebra nada.
+function liberarMemoria() {
+    if (global.gc) {
+        global.gc();
+    }
 }
 
 function mmParaPt(valorStr) {
@@ -110,154 +119,151 @@ function cabecalhoEstaVazio(headerHtmlProcessado) {
     return semEspacos === '<div></div>' || semEspacos === '';
 }
 
-async function renderizarDocumento(page, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens) {
+// =========================================================================
+// RENDERIZACAO - OTIMIZADA PARA BAIXO CONSUMO DE MEMORIA
+//
+// TRES MUDANCAS EM RELACAO A VERSAO ANTERIOR:
+//
+// 1) UMA ABA (page) POR SEGMENTO, FECHADA LOGO APOS O USO.
+//    Antes, a mesma aba era reaproveitada para todos os segmentos. O
+//    Chromium mantem em memoria o layout/render tree da pagina anterior,
+//    entao ao chegar no segmento mais pesado a RAM ja estava ocupada
+//    pelos anteriores. Fechando a aba, esse espaco e devolvido ao SO.
+//
+// 2) BUFFERS GRAVADOS EM DISCO (/tmp), NAO ACUMULADOS EM RAM.
+//    Antes, todos os PDFs parciais ficavam num array em memoria ate o
+//    final. Agora cada um vai para um arquivo temporario e so e lido de
+//    volta no momento exato da juncao, um por vez.
+//
+// 3) RECEBE O BROWSER (nao a page), pois agora cria/fecha abas sozinha.
+// =========================================================================
+async function renderizarDocumento(browser, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens, prefixoTmp) {
     let temSegmentosPaisagem = false;
     let bufferFinal;
 
     if (!htmlContent.includes(LANDSCAPE_START)) {
-        log('    documento unico (sem paisagem) - carregando HTML no navegador...');
-        const htmlLimpo = removerMarcadoresDeLogo(htmlContent);
-        await page.setContent(blocoGeometria + htmlLimpo, { waitUntil: 'networkidle0', timeout: 120000 });
-        log('    HTML carregado - imprimindo PDF...');
-        bufferFinal = await page.pdf(pdfOptionsRetrato);
-        log('    PDF impresso');
+        log('    documento unico (sem paisagem) - abrindo aba...');
+        const page = await browser.newPage();
+        try {
+            const htmlLimpo = removerMarcadoresDeLogo(htmlContent);
+            await page.setContent(blocoGeometria + htmlLimpo, { waitUntil: 'networkidle0', timeout: 120000 });
+            log('    HTML carregado - imprimindo PDF...');
+            bufferFinal = await page.pdf(pdfOptionsRetrato);
+            log('    PDF impresso');
+        } finally {
+            await page.close();
+            liberarMemoria();
+        }
     } else {
         temSegmentosPaisagem = true;
         const segmentos = dividirEmSegmentos(htmlContent);
         log('    documento com ' + segmentos.length + ' segmento(s) (retrato/paisagem)');
-        const buffersGerados = [];
+
+        const arquivosTmp = [];
+
         for (let i = 0; i < segmentos.length; i++) {
             const seg = segmentos[i];
-            if (seg.tipo === 'retrato') {
-                if (seg.html.trim() === '') continue;
-                log('    segmento ' + (i + 1) + '/' + segmentos.length + ' (retrato) - carregando...');
-                const htmlRetratoLimpo = removerMarcadoresDeLogo(seg.html);
-                await page.setContent(blocoGeometria + htmlRetratoLimpo, { waitUntil: 'networkidle0', timeout: 120000 });
-                log('    segmento ' + (i + 1) + '/' + segmentos.length + ' (retrato) - imprimindo...');
-                buffersGerados.push(await page.pdf(pdfOptionsRetrato));
-                log('    segmento ' + (i + 1) + '/' + segmentos.length + ' (retrato) OK');
-            } else {
-                log('    segmento ' + (i + 1) + '/' + segmentos.length + ' (paisagem) - carregando...');
-                const conteudoComCabecalho = ehTemplateSiemens ? injetarCabecalhoPaisagem(seg.html) : removerMarcadoresDeLogo(seg.html);
-                let docPaisagem = '<!DOCTYPE html><html><head><meta charset="utf-8"><style>html, body { margin: 0; padding: 0; } table { max-width: 100% !important; } th, td { overflow-wrap: break-word; word-wrap: break-word; }</style></head><body>' + conteudoComCabecalho + '</body></html>';
-                await page.setContent(docPaisagem, { waitUntil: 'networkidle0', timeout: 120000 });
-                log('    segmento ' + (i + 1) + '/' + segmentos.length + ' (paisagem) - imprimindo...');
-                buffersGerados.push(await page.pdf(pdfOptionsPaisagem));
-                log('    segmento ' + (i + 1) + '/' + segmentos.length + ' (paisagem) OK');
+            const rotulo = 'segmento ' + (i + 1) + '/' + segmentos.length + ' (' + seg.tipo + ')';
+
+            if (seg.tipo === 'retrato' && seg.html.trim() === '') {
+                continue;
             }
+
+            // Aba nova e exclusiva para este segmento
+            const page = await browser.newPage();
+            let buffer;
+
+            try {
+                if (seg.tipo === 'retrato') {
+                    log('    ' + rotulo + ' - carregando...');
+                    const htmlRetratoLimpo = removerMarcadoresDeLogo(seg.html);
+                    await page.setContent(blocoGeometria + htmlRetratoLimpo, { waitUntil: 'networkidle0', timeout: 120000 });
+                    log('    ' + rotulo + ' - imprimindo...');
+                    buffer = await page.pdf(pdfOptionsRetrato);
+                } else {
+                    log('    ' + rotulo + ' - carregando...');
+                    const conteudoComCabecalho = ehTemplateSiemens ? injetarCabecalhoPaisagem(seg.html) : removerMarcadoresDeLogo(seg.html);
+                    let docPaisagem = '<!DOCTYPE html><html><head><meta charset="utf-8"><style>html, body { margin: 0; padding: 0; } table { max-width: 100% !important; } th, td { overflow-wrap: break-word; word-wrap: break-word; }</style></head><body>' + conteudoComCabecalho + '</body></html>';
+                    await page.setContent(docPaisagem, { waitUntil: 'networkidle0', timeout: 120000 });
+                    log('    ' + rotulo + ' - imprimindo...');
+                    buffer = await page.pdf(pdfOptionsPaisagem);
+                }
+            } finally {
+                // Fecha a aba ANTES de qualquer outra coisa, devolvendo
+                // ao sistema a memoria que o Chromium usou neste segmento
+                await page.close();
+            }
+
+            // Grava em disco e solta a referencia da RAM
+            const caminho = path.join(os.tmpdir(), prefixoTmp + '_seg' + i + '.pdf');
+            await fs.promises.writeFile(caminho, buffer);
+            arquivosTmp.push(caminho);
+            buffer = null;
+            liberarMemoria();
+
+            log('    ' + rotulo + ' OK (salvo em disco)');
         }
-        log('    juntando ' + buffersGerados.length + ' buffer(s) em um PDF unico...');
+
+        log('    juntando ' + arquivosTmp.length + ' arquivo(s) em um PDF unico...');
         const pdfFinal = await PDFDocument.create();
-        for (const buf of buffersGerados) {
+        for (const caminho of arquivosTmp) {
+            const buf = await fs.promises.readFile(caminho);
             const src = await PDFDocument.load(buf);
             const paginasCopiadas = await pdfFinal.copyPages(src, src.getPageIndices());
             paginasCopiadas.forEach(function (p) { pdfFinal.addPage(p); });
+            // Remove o temporario assim que ele ja foi absorvido
+            await fs.promises.unlink(caminho).catch(function () { });
+            liberarMemoria();
         }
         bufferFinal = Buffer.from(await pdfFinal.save());
         log('    PDF unico montado');
+        liberarMemoria();
     }
+
     return { buffer: bufferFinal, temSegmentosPaisagem: temSegmentosPaisagem };
 }
 
-async function corrigirNumeracaoRodape(pdfBuffer) {
+// =========================================================================
+// POS-PROCESSAMENTO UNIFICADO (rodape + indice)
+//
+// MUDANCA IMPORTANTE: antes existiam duas funcoes independentes
+// (corrigirNumeracaoRodape e processarIndice), e CADA UMA fazia:
+//   - um pdfParse completo do documento (le todas as paginas)
+//   - um PDFDocument.load() completo
+//   - um PDFDocument.save() completo
+//
+// Ou seja, o PDF inteiro era carregado e reserializado DUAS vezes em
+// sequencia, dobrando o pico de memoria justamente no fim do processo.
+//
+// Agora e UMA leitura (pdfParse), UM load e UM save, com as duas
+// correcoes aplicadas no mesmo documento em memoria. A ordem das
+// operacoes de desenho e identica a anterior (rodape primeiro, indice
+// depois) - o resultado visual e exatamente o mesmo.
+//
+// Obs.: o reposicionamento do indice nao depende do rodape, e o rodape
+// nao altera a posicao dos itens do indice, entao ler as posicoes uma
+// unica vez (antes das duas correcoes) e seguro.
+// =========================================================================
+async function posProcessarPDF(pdfBuffer, mapaDestinos, mLateralPt, corrigirRodape) {
     const pagesItems = [];
+
     function custom_render_page(pageData) {
         return pageData.getTextContent().then(function (textContent) {
             pagesItems.push(textContent.items.map(function (item) {
-                return { str: item.str, x: item.transform[4], y: item.transform[5], width: item.width, fontHeight: Math.hypot(item.transform[2], item.transform[3]) || 8.5 };
+                return {
+                    str: item.str,
+                    x: item.transform[4],
+                    y: item.transform[5],
+                    width: item.width,
+                    fontHeight: Math.hypot(item.transform[2], item.transform[3])
+                };
             }));
             return '';
         });
     }
+
     await pdfParse(pdfBuffer, { pagerender: custom_render_page });
-    const pdfDoc = await PDFDocument.load(pdfBuffer);
-    const totalPaginas = pdfDoc.getPageCount();
-    const fonteCorrecao = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-    for (let i = 0; i < pagesItems.length; i++) {
-        const items = pagesItems[i];
-        const idxMarcador = items.findIndex(function (it) { return /FOLHA\s*:?/i.test(it.str); });
-        if (idxMarcador === -1) continue;
-        const baseY = items[idxMarcador].y;
-        const baseX = items[idxMarcador].x;
-        const itensDaLinha = items.filter(function (it) { return Math.abs(it.y - baseY) < 2 && it.x >= baseX - 2; });
-        if (itensDaLinha.length === 0) continue;
-        const minX = Math.min.apply(null, itensDaLinha.map(function (it) { return it.x; }));
-        const maxX = Math.max.apply(null, itensDaLinha.map(function (it) { return it.x + it.width; }));
-        const fontSize = items[idxMarcador].fontHeight;
-        const alturaCaixa = fontSize * 1.5;
-        const yCaixa = baseY - alturaCaixa * 0.3;
-        const pagina = pdfDoc.getPage(i);
-        pagina.drawRectangle({ x: minX - 3, y: yCaixa, width: (maxX - minX) + 6, height: alturaCaixa, color: rgb(1, 1, 1) });
-        pagina.drawText('FOLHA: ' + (i + 1) + ' de ' + totalPaginas, { x: minX, y: baseY, size: fontSize, font: fonteCorrecao, color: rgb(0, 0, 0) });
-    }
-    return Buffer.from(await pdfDoc.save());
-}
-
-// =========================================================================
-// REALINHA numeros do indice a margem real + redesenha a linha pontilhada
-// INTEIRA (titulo->numero) num unico estilo + cria os links.
-//
-// FIX APLICADO NESTA VERSAO: a busca do "fim do titulo" (titleEndX) so
-// olhava itens na MESMA altura Y do numero (tolerancia de 2pt) - mas o
-// titulo principal (negrito, MAIOR) fica na linha de CIMA, e a traducao
-// (menor, italico) fica na linha de BAIXO, na mesma altura do numero.
-// Isso fazia o codigo enxergar so o fim da traducao (mais curta) e
-// comecar a apagar/redesenhar ANTES do fim do texto em negrito - cortando
-// visualmente o final das palavras do titulo principal.
-//
-// CORRECAO: a tolerancia de busca de "itens na mesma linha logica" foi
-// ampliada de 2pt para 16pt - suficiente para cobrir tanto a linha do
-// titulo principal quanto a linha da traducao logo abaixo, garantindo
-// que titleEndX reflita o fim do texto MAIS LONGO entre as duas linhas.
-// =========================================================================
-async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
-    const pagesItems = [];
-    function custom_render_page(pageData) {
-        return pageData.getTextContent().then(function (textContent) {
-            pagesItems.push(textContent.items.map(function (item) {
-                return { str: item.str, x: item.transform[4], y: item.transform[5], width: item.width, fontHeight: Math.hypot(item.transform[2], item.transform[3]) || 9 };
-            }));
-            return '';
-        });
-    }
-    await pdfParse(pdfBuffer, { pagerender: custom_render_page });
-
-    const ocorrencias = [];
-    for (let p = 0; p < pagesItems.length; p++) {
-        const items = pagesItems[p];
-        for (let idx = 0; idx < items.length; idx++) {
-            const item = items[idx];
-            const match = item.str.match(/@@LNK_([A-Za-z0-9_]+)@@/);
-            if (!match) continue;
-            const codigo = match[1];
-
-            let numItem = null;
-            for (let k = idx - 1; k >= 0; k--) {
-                const cand = items[k];
-                if (Math.abs(cand.y - item.y) > 2) break;
-                if (/^\d{3}$/.test(cand.str.trim())) { numItem = cand; break; }
-            }
-
-            const rowY = numItem ? numItem.y : item.y;
-            let titleEndX = null;
-            const limiteX = numItem ? numItem.x : item.x;
-            items.forEach(function (it) {
-                // CORRIGIDO: tolerancia de 16pt (era 2pt) para tambem
-                // enxergar a linha do titulo principal (negrito, maior,
-                // uma linha acima da traducao) na mesma "linha logica".
-                if (Math.abs(it.y - rowY) > 16) return;
-                if (it === numItem || it === item) return;
-                if (it.x >= limiteX) return;
-                const rightEdge = it.x + it.width;
-                if (titleEndX === null || rightEdge > titleEndX) titleEndX = rightEdge;
-            });
-
-            ocorrencias.push({ codigo: codigo, pageIndex: p, markerX: item.x, markerY: item.y, numItem: numItem, titleEndX: titleEndX });
-        }
-    }
-
-    if (ocorrencias.length === 0) return pdfBuffer;
+    log('    texto do PDF final extraido (' + pagesItems.length + ' paginas)');
 
     const pdfDoc = await PDFDocument.load(pdfBuffer);
     const pages = pdfDoc.getPages();
@@ -265,112 +271,181 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
     const fonteNormal = await pdfDoc.embedFont(StandardFonts.Helvetica);
     const fonteBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
 
-    const BUFFER_MARGEM = 2;
-    const LARGURA_LINK_PADRAO = 34;
-    const DOT_RADIUS = 0.4;
-    const DOT_PERIOD = 2.5;
+    // ---------------------------------------------------------------
+    // PARTE 1 - NUMERACAO DO RODAPE ("FOLHA: X de Y")
+    // ---------------------------------------------------------------
+    if (corrigirRodape) {
+        const totalPaginas = pdfDoc.getPageCount();
+        let corrigidas = 0;
 
-    ocorrencias.forEach(function (oc) {
-        const destPageNum = mapaDestinos[oc.codigo];
-        if (!destPageNum || destPageNum < 1 || destPageNum > pages.length) return;
-        if (oc.pageIndex < 0 || oc.pageIndex >= pages.length) return;
+        for (let i = 0; i < pagesItems.length && i < pages.length; i++) {
+            const items = pagesItems[i];
+            const idxMarcador = items.findIndex(function (it) { return /FOLHA\s*:?/i.test(it.str); });
+            if (idxMarcador === -1) continue;
 
-        const paginaOrigem = pages[oc.pageIndex];
-        const paginaDestino = pages[destPageNum - 1];
-        const pageWidth = paginaOrigem.getWidth();
-        const targetRightX = pageWidth - mLateralPt - BUFFER_MARGEM;
+            const baseY = items[idxMarcador].y;
+            const baseX = items[idxMarcador].x;
+            const itensDaLinha = items.filter(function (it) { return Math.abs(it.y - baseY) < 2 && it.x >= baseX - 2; });
+            if (itensDaLinha.length === 0) continue;
 
-        let rectX0, rectX1, rectY0, rectY1;
+            const minX = Math.min.apply(null, itensDaLinha.map(function (it) { return it.x; }));
+            const maxX = Math.max.apply(null, itensDaLinha.map(function (it) { return it.x + it.width; }));
+            const fontSize = items[idxMarcador].fontHeight || 8.5;
+            const alturaCaixa = fontSize * 1.5;
+            const yCaixa = baseY - alturaCaixa * 0.3;
+            const pagina = pages[i];
 
-        if (oc.numItem && oc.titleEndX !== null) {
-            const numItem = oc.numItem;
-            const novoX = targetRightX - numItem.width;
+            pagina.drawRectangle({ x: minX - 3, y: yCaixa, width: (maxX - minX) + 6, height: alturaCaixa, color: rgb(1, 1, 1) });
+            pagina.drawText('FOLHA: ' + (i + 1) + ' de ' + totalPaginas, { x: minX, y: baseY, size: fontSize, font: fonteBold, color: rgb(0, 0, 0) });
+            corrigidas++;
+        }
+        log('    rodape corrigido em ' + corrigidas + ' pagina(s)');
+    }
 
-            const numUnderscores = (oc.codigo.match(/_/g) || []).length;
-            const fonteEscolhida = (numUnderscores === 1) ? fonteBold : fonteNormal;
+    // ---------------------------------------------------------------
+    // PARTE 2 - INDICE (alinhamento do numero, pontilhado e links)
+    // ---------------------------------------------------------------
+    if (mapaDestinos && Object.keys(mapaDestinos).length > 0) {
+        const ocorrencias = [];
 
-            // A area apagada/redesenhada cobre SOMENTE a altura da linha
-            // do NUMERO (nao a linha do titulo em negrito acima) - so a
-            // deteccao do fim do texto usa a tolerancia ampliada; o
-            // desenho continua restrito a linha correta.
-            //
-            // CORRIGIDO: margem vertical ampliada de 3pt para 6pt. O
-            // pontilhado original (CSS border-bottom) pode nao estar
-            // exatamente alinhado com o y do texto - com margem pequena,
-            // uma tira fina do pontilhado antigo sobrava sem ser apagada,
-            // aparecendo ao lado do pontilhado novo (dois estilos juntos).
-            const rowTop = numItem.y - 6;
-            const rowBottom = numItem.y + numItem.fontHeight + 6;
-            const rowHeight = rowBottom - rowTop;
+        for (let p = 0; p < pagesItems.length; p++) {
+            const items = pagesItems[p];
+            for (let idx = 0; idx < items.length; idx++) {
+                const item = items[idx];
+                const match = item.str.match(/@@LNK_([A-Za-z0-9_]+)@@/);
+                if (!match) continue;
+                const codigo = match[1];
 
-            // Apaga do fim do titulo ATE A BORDA FISICA DA PAGINA - nao
-            // ha calculo de "onde parar", entao nao sobra nenhum resquicio
-            // do numero/pontilhado antigo, seja qual for o valor de delta.
-            const whiteFromX = oc.titleEndX + 2;
-            paginaOrigem.drawRectangle({
-                x: whiteFromX,
-                y: rowTop,
-                width: Math.max(0, pageWidth - whiteFromX),
-                height: rowHeight,
-                color: rgb(1, 1, 1)
-            });
+                let numItem = null;
+                for (let k = idx - 1; k >= 0; k--) {
+                    const cand = items[k];
+                    if (Math.abs(cand.y - item.y) > 2) break;
+                    if (/^\d{3}$/.test(cand.str.trim())) { numItem = cand; break; }
+                }
 
-            // Redesenha o pontilhado INTEIRO, de um so estilo, do fim do
-            // titulo ate pouco antes do numero (posicao final).
-            const dotY = numItem.y - 1.5;
-            const dotsFromX = oc.titleEndX + 4;
-            const dotsToX = novoX - 3;
-            for (let px = dotsFromX; px < dotsToX; px += DOT_PERIOD) {
-                paginaOrigem.drawCircle({ x: px, y: dotY, size: DOT_RADIUS, color: rgb(0, 0, 0) });
+                const rowY = numItem ? numItem.y : item.y;
+                let titleEndX = null;
+                const limiteX = numItem ? numItem.x : item.x;
+                items.forEach(function (it) {
+                    // Tolerancia de 16pt: enxerga tanto a linha do titulo
+                    // principal (negrito, acima) quanto a da traducao.
+                    if (Math.abs(it.y - rowY) > 16) return;
+                    if (it === numItem || it === item) return;
+                    if (it.x >= limiteX) return;
+                    const rightEdge = it.x + it.width;
+                    if (titleEndX === null || rightEdge > titleEndX) titleEndX = rightEdge;
+                });
+
+                ocorrencias.push({ codigo: codigo, pageIndex: p, markerX: item.x, markerY: item.y, numItem: numItem, titleEndX: titleEndX });
             }
-
-            // Redesenha o numero na posicao final, rente a margem real
-            paginaOrigem.drawText(numItem.str, {
-                x: novoX,
-                y: numItem.y,
-                size: numItem.fontHeight,
-                font: fonteEscolhida,
-                color: rgb(0, 0, 0)
-            });
-
-            rectX0 = Math.max(0, novoX - 2);
-            rectX1 = novoX + numItem.width + 2;
-            rectY0 = numItem.y - 2;
-            rectY1 = numItem.y + numItem.fontHeight + 2;
-        } else if (oc.numItem) {
-            rectX0 = Math.max(0, oc.numItem.x - 2);
-            rectX1 = oc.numItem.x + oc.numItem.width + 2;
-            rectY0 = oc.numItem.y - 2;
-            rectY1 = oc.numItem.y + oc.numItem.fontHeight + 2;
-        } else {
-            rectX0 = Math.max(0, oc.markerX - LARGURA_LINK_PADRAO);
-            rectX1 = oc.markerX + 2;
-            rectY0 = oc.markerY - 2;
-            rectY1 = oc.markerY + 12;
         }
 
-        const linkDict = context.obj({});
-        linkDict.set(PDFName.of('Type'), PDFName.of('Annot'));
-        linkDict.set(PDFName.of('Subtype'), PDFName.of('Link'));
-        linkDict.set(PDFName.of('Rect'), context.obj([rectX0, rectY0, rectX1, rectY1]));
-        linkDict.set(PDFName.of('Border'), context.obj([0, 0, 0]));
-        linkDict.set(PDFName.of('Dest'), context.obj([paginaDestino.ref, PDFName.of('Fit')]));
-        const linkRef = context.register(linkDict);
+        const BUFFER_MARGEM = 2;
+        const LARGURA_LINK_PADRAO = 34;
+        const DOT_RADIUS = 0.4;
+        const DOT_PERIOD = 2.5;
+        let linksCriados = 0;
 
-        const existentesRef = paginaOrigem.node.get(PDFName.of('Annots'));
-        let annotsArray;
-        if (existentesRef) {
-            annotsArray = context.lookup(existentesRef);
-            if (!annotsArray || typeof annotsArray.push !== 'function') {
+        ocorrencias.forEach(function (oc) {
+            const destPageNum = mapaDestinos[oc.codigo];
+            if (!destPageNum || destPageNum < 1 || destPageNum > pages.length) return;
+            if (oc.pageIndex < 0 || oc.pageIndex >= pages.length) return;
+
+            const paginaOrigem = pages[oc.pageIndex];
+            const paginaDestino = pages[destPageNum - 1];
+            const pageWidth = paginaOrigem.getWidth();
+            const targetRightX = pageWidth - mLateralPt - BUFFER_MARGEM;
+
+            let rectX0, rectX1, rectY0, rectY1;
+
+            if (oc.numItem && oc.titleEndX !== null) {
+                const numItem = oc.numItem;
+                const alturaFonte = numItem.fontHeight || 9;
+                const novoX = targetRightX - numItem.width;
+
+                const numUnderscores = (oc.codigo.match(/_/g) || []).length;
+                const fonteEscolhida = (numUnderscores === 1) ? fonteBold : fonteNormal;
+
+                // Margem vertical de 6pt garante que o pontilhado original
+                // (border-bottom do CSS) seja totalmente coberto - com
+                // margem menor sobrava uma tira fina do estilo antigo.
+                const rowTop = numItem.y - 6;
+                const rowBottom = numItem.y + alturaFonte + 6;
+                const rowHeight = rowBottom - rowTop;
+
+                // Apaga do fim do titulo ate a borda fisica da pagina
+                const whiteFromX = oc.titleEndX + 2;
+                paginaOrigem.drawRectangle({
+                    x: whiteFromX,
+                    y: rowTop,
+                    width: Math.max(0, pageWidth - whiteFromX),
+                    height: rowHeight,
+                    color: rgb(1, 1, 1)
+                });
+
+                // Redesenha o pontilhado inteiro, de um so estilo
+                const dotY = numItem.y - 1.5;
+                const dotsFromX = oc.titleEndX + 4;
+                const dotsToX = novoX - 3;
+                for (let px = dotsFromX; px < dotsToX; px += DOT_PERIOD) {
+                    paginaOrigem.drawCircle({ x: px, y: dotY, size: DOT_RADIUS, color: rgb(0, 0, 0) });
+                }
+
+                paginaOrigem.drawText(numItem.str, {
+                    x: novoX,
+                    y: numItem.y,
+                    size: alturaFonte,
+                    font: fonteEscolhida,
+                    color: rgb(0, 0, 0)
+                });
+
+                rectX0 = Math.max(0, novoX - 2);
+                rectX1 = novoX + numItem.width + 2;
+                rectY0 = numItem.y - 2;
+                rectY1 = numItem.y + alturaFonte + 2;
+            } else if (oc.numItem) {
+                const alturaFonte = oc.numItem.fontHeight || 9;
+                rectX0 = Math.max(0, oc.numItem.x - 2);
+                rectX1 = oc.numItem.x + oc.numItem.width + 2;
+                rectY0 = oc.numItem.y - 2;
+                rectY1 = oc.numItem.y + alturaFonte + 2;
+            } else {
+                rectX0 = Math.max(0, oc.markerX - LARGURA_LINK_PADRAO);
+                rectX1 = oc.markerX + 2;
+                rectY0 = oc.markerY - 2;
+                rectY1 = oc.markerY + 12;
+            }
+
+            const linkDict = context.obj({});
+            linkDict.set(PDFName.of('Type'), PDFName.of('Annot'));
+            linkDict.set(PDFName.of('Subtype'), PDFName.of('Link'));
+            linkDict.set(PDFName.of('Rect'), context.obj([rectX0, rectY0, rectX1, rectY1]));
+            linkDict.set(PDFName.of('Border'), context.obj([0, 0, 0]));
+            linkDict.set(PDFName.of('Dest'), context.obj([paginaDestino.ref, PDFName.of('Fit')]));
+            const linkRef = context.register(linkDict);
+
+            const existentesRef = paginaOrigem.node.get(PDFName.of('Annots'));
+            let annotsArray;
+            if (existentesRef) {
+                annotsArray = context.lookup(existentesRef);
+                if (!annotsArray || typeof annotsArray.push !== 'function') {
+                    annotsArray = context.obj([]);
+                    paginaOrigem.node.set(PDFName.of('Annots'), annotsArray);
+                }
+            } else {
                 annotsArray = context.obj([]);
                 paginaOrigem.node.set(PDFName.of('Annots'), annotsArray);
             }
-        } else {
-            annotsArray = context.obj([]);
-            paginaOrigem.node.set(PDFName.of('Annots'), annotsArray);
-        }
-        annotsArray.push(linkRef);
-    });
+            annotsArray.push(linkRef);
+            linksCriados++;
+        });
+
+        log('    indice: ' + linksCriados + ' link(s) criado(s)');
+    }
+
+    // Libera a lista de posicoes antes de serializar o PDF
+    pagesItems.length = 0;
+    liberarMemoria();
 
     return Buffer.from(await pdfDoc.save());
 }
@@ -378,9 +453,12 @@ async function processarIndice(pdfBuffer, mapaDestinos, mLateralPt) {
 app.post('/gerar-pdf', async (req, res) => {
     let browser;
 
-    // Reinicia o cronometro a cada requisicao
     iniciarCronometro();
     log('===== NOVA REQUISICAO RECEBIDA =====');
+
+    // Prefixo unico para os arquivos temporarios desta requisicao,
+    // evitando colisao caso duas execucoes rodem ao mesmo tempo
+    const prefixoTmp = 'fpt_' + Date.now() + '_' + Math.floor(Math.random() * 10000);
 
     try {
         if (!req.body || typeof req.body.html !== 'string' || req.body.html.trim() === '') {
@@ -427,23 +505,48 @@ app.post('/gerar-pdf', async (req, res) => {
         browser = await puppeteer.launch({
             headless: 'new',
             executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-zygote']
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--no-zygote',
+                // Flags adicionais para reduzir o consumo de RAM do Chromium
+                '--disable-extensions',
+                '--disable-background-networking',
+                '--disable-background-timer-throttling',
+                '--disable-client-side-phishing-detection',
+                '--disable-default-apps',
+                '--disable-sync',
+                '--disable-translate',
+                '--mute-audio',
+                '--no-first-run',
+                '--hide-scrollbars',
+                '--metrics-recording-only',
+                '--disable-features=site-per-process,TranslateUI'
+            ]
         });
         log('Navegador iniciado');
 
-        const page = await browser.newPage();
         const mapaDestinos = {};
 
         if (htmlContent.includes('#ANC_')) {
-            log('ETAPA 1/5 - Renderizando PDF fantasma (para calcular as paginas do indice)...');
+            log('ETAPA 1/4 - Renderizando PDF fantasma (para calcular as paginas do indice)...');
             const htmlFantasma = htmlContent.replace(/\{\{PAG_CAP_[A-Za-z0-9_]+\}\}/g, '000');
-            const resultadoFantasma = await renderizarDocumento(page, htmlFantasma, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens);
-            log('ETAPA 1/5 - PDF fantasma pronto');
+            const resultadoFantasma = await renderizarDocumento(browser, htmlFantasma, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens, prefixoTmp + '_ghost');
+            log('ETAPA 1/4 - PDF fantasma pronto');
 
-            log('ETAPA 2/5 - Extraindo texto do PDF fantasma (pdf-parse)...');
+            log('ETAPA 2/4 - Extraindo texto do PDF fantasma (pdf-parse)...');
             const pdfData = await pdfParse(resultadoFantasma.buffer, { pagerender: render_page });
+
+            // Solta o PDF fantasma da memoria IMEDIATAMENTE apos extrair o
+            // texto - ele nao e mais necessario e ocupava espaco durante
+            // toda a renderizacao final na versao anterior.
+            resultadoFantasma.buffer = null;
+            liberarMemoria();
+
             const pages = pdfData.text.split('\n---PAGE_BREAK---\n');
-            log('ETAPA 2/5 - Texto extraido de ' + pages.length + ' pagina(s)');
+            log('ETAPA 2/4 - Texto extraido de ' + pages.length + ' pagina(s)');
 
             const pagesNormalizadas = pages.map(function (p) { return normalizarAncora(p); });
             const anchors = htmlContent.match(/#ANC_[A-Za-z0-9_]+#/g);
@@ -477,32 +580,46 @@ app.post('/gerar-pdf', async (req, res) => {
                 log('Substituindo ' + listaOrfaos.length + ' placeholder(s) orfao(s) por "---"');
                 listaOrfaos.forEach(function (o) { htmlContent = htmlContent.split(o).join('---'); });
             }
+
+            // Libera os textos extraidos (podem somar varios MB em
+            // documentos de ~100 paginas) antes da renderizacao final
+            pages.length = 0;
+            pagesNormalizadas.length = 0;
+            pdfData.text = '';
+            liberarMemoria();
         }
 
-        log('ETAPA 3/5 - Renderizando PDF final...');
-        const resultadoFinal = await renderizarDocumento(page, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens);
+        log('ETAPA 3/4 - Renderizando PDF final...');
+        const resultadoFinal = await renderizarDocumento(browser, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens, prefixoTmp + '_final');
         let finalPdfBuffer = resultadoFinal.buffer;
-        log('ETAPA 3/5 - PDF final pronto (' + (finalPdfBuffer.length / 1024 / 1024).toFixed(1) + ' MB)');
+        log('ETAPA 3/4 - PDF final pronto (' + (finalPdfBuffer.length / 1024 / 1024).toFixed(1) + ' MB)');
 
-        if (resultadoFinal.temSegmentosPaisagem) {
-            log('ETAPA 4/5 - Corrigindo numeracao do rodape...');
-            finalPdfBuffer = await corrigirNumeracaoRodape(finalPdfBuffer);
-            log('ETAPA 4/5 - Numeracao corrigida');
-        } else {
-            log('ETAPA 4/5 - Pulada (documento sem segmentos em paisagem)');
-        }
+        // Fecha o navegador ANTES do pos-processamento: a partir daqui so
+        // se trabalha com pdf-lib, e manter o Chromium vivo seria puro
+        // desperdicio de memoria no momento mais critico.
+        log('Fechando navegador (nao e mais necessario)...');
+        await browser.close();
+        browser = null;
+        liberarMemoria();
 
-        if (Object.keys(mapaDestinos).length > 0) {
-            log('ETAPA 5/5 - Processando indice (alinhamento, pontilhado e links)...');
+        const precisaRodape = resultadoFinal.temSegmentosPaisagem;
+        const precisaIndice = Object.keys(mapaDestinos).length > 0;
+
+        if (precisaRodape || precisaIndice) {
+            log('ETAPA 4/4 - Pos-processamento (rodape + indice em uma unica passagem)...');
             const mLateralPt = mmParaPt(mLateral);
-            finalPdfBuffer = await processarIndice(finalPdfBuffer, mapaDestinos, mLateralPt);
-            log('ETAPA 5/5 - Indice processado');
+            finalPdfBuffer = await posProcessarPDF(finalPdfBuffer, precisaIndice ? mapaDestinos : null, mLateralPt, precisaRodape);
+            log('ETAPA 4/4 - Pos-processamento concluido');
         } else {
-            log('ETAPA 5/5 - Pulada (nenhuma ancora mapeada)');
+            log('ETAPA 4/4 - Pulada (nada a corrigir)');
         }
 
         log('Convertendo para base64 e enviando resposta...');
-        res.json({ pdfBase64: finalPdfBuffer.toString('base64') });
+        const base64 = finalPdfBuffer.toString('base64');
+        finalPdfBuffer = null;
+        liberarMemoria();
+
+        res.json({ pdfBase64: base64 });
         log('===== CONCLUIDO COM SUCESSO =====');
 
     } catch (error) {
@@ -514,6 +631,19 @@ app.post('/gerar-pdf', async (req, res) => {
             await browser.close();
             log('Navegador fechado');
         }
+        // Limpeza de seguranca: remove qualquer temporario que tenha
+        // sobrado (por exemplo, se a requisicao falhou no meio)
+        try {
+            const arquivos = await fs.promises.readdir(os.tmpdir());
+            for (const nome of arquivos) {
+                if (nome.startsWith(prefixoTmp)) {
+                    await fs.promises.unlink(path.join(os.tmpdir(), nome)).catch(function () { });
+                }
+            }
+        } catch (e) {
+            // silencioso - limpeza e best-effort
+        }
+        liberarMemoria();
     }
 });
 
