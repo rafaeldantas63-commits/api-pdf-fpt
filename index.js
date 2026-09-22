@@ -5,6 +5,7 @@ const { PDFDocument, StandardFonts, rgb, PDFName } = require('pdf-lib');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -17,43 +18,115 @@ const LOGO_DIR_START = '<!--LOGO_DIR-->';
 const LOGO_DIR_END = '<!--/LOGO_DIR-->';
 
 // =========================================================================
-// OTIMIZACAO DE TEMPO - ESTRATEGIA DE ESPERA DO PUPPETEER
+// MODO ASSINCRONO (mudanca estrutural desta versao)
 //
-// ANTES: waitUntil: 'networkidle0'
-//   Essa opcao faz o Puppeteer esperar a rede ficar COMPLETAMENTE ociosa
-//   (zero conexoes ativas) por 500ms ANTES de considerar a pagina pronta.
-//   Faz sentido em paginas que baixam imagens, fontes ou dados via AJAX.
+// PROBLEMA QUE ISSO RESOLVE:
+//   O conector HTTP do Power Automate tem um teto RIGIDO de 120 segundos
+//   para receber a resposta. Nao existe configuracao que aumente isso - o
+//   campo "Action timeout" (PT5M) controla o tempo total da acao, nao a
+//   espera pela primeira resposta. Como a geracao completa leva ~118s e
+//   encosta no limite, qualquer variacao de carga fazia o fluxo falhar
+//   com "the server did not respond within the timeout limit".
 //
-// AGORA: waitUntil: 'domcontentloaded'
-//   O HTML gerado pelo Power Apps e 100% AUTOCONTIDO: todo o conteudo vem
-//   embutido na string (inclusive as imagens, que sao base64 inline). Nao
-//   ha NENHUMA requisicao de rede a ser aguardada. Portanto, o
-//   'networkidle0' estava apenas cobrando um pedagio de ~500ms a 2s por
-//   chamada, sem beneficio algum.
+// COMO FUNCIONA AGORA:
+//   1) POST /gerar-pdf     -> responde em ~1s com um jobId e status 202.
+//                             O processamento continua em segundo plano.
+//   2) GET  /status/:jobId -> diz se ainda esta processando, se concluiu
+//                             ou se deu erro. Resposta pequena e rapida.
+//   3) GET  /download/:jobId -> devolve o PDF em base64 (so quando pronto).
 //
-//   Como sao 6 chamadas por requisicao (3 segmentos no PDF fantasma + 3
-//   no PDF final), a economia estimada fica entre 3 e 12 segundos - o
-//   suficiente para tentar trazer o total abaixo do teto de 120s imposto
-//   pelo conector HTTP do Power Automate.
+//   O Power Apps ja tem um Timer que faz polling; ele passa a consultar o
+//   /status em vez de esperar a resposta do /gerar-pdf. O teto de 120s
+//   deixa de importar, porque nenhuma chamada individual demora mais que
+//   alguns segundos.
+//
+// ONDE OS JOBS FICAM:
+//   Em arquivos no diretorio temporario do sistema (/tmp), nao em memoria.
+//   Guardar PDFs de ~1 MB em RAM enquanto o cliente nao busca acabaria
+//   estourando o limite do plano basico do Render se varias geracoes
+//   acontecessem em sequencia.
 // =========================================================================
-const ESPERA_RENDER = 'domcontentloaded';
+const DIR_JOBS = path.join(os.tmpdir(), 'jobs_pdf');
+const JOB_VALIDADE_MS = 30 * 60 * 1000; // 30 minutos
+
+// Garante que a pasta de jobs existe assim que o servidor sobe
+try {
+    if (!fs.existsSync(DIR_JOBS)) {
+        fs.mkdirSync(DIR_JOBS, { recursive: true });
+    }
+} catch (e) {
+    console.error('Nao foi possivel criar a pasta de jobs:', e.message);
+}
+
+function caminhoStatus(jobId) {
+    return path.join(DIR_JOBS, jobId + '.json');
+}
+
+function caminhoPdf(jobId) {
+    return path.join(DIR_JOBS, jobId + '.pdf');
+}
+
+async function gravarStatus(jobId, dados) {
+    const registro = Object.assign({ jobId: jobId, atualizadoEm: Date.now() }, dados);
+    await fs.promises.writeFile(caminhoStatus(jobId), JSON.stringify(registro), 'utf8');
+}
+
+async function lerStatus(jobId) {
+    try {
+        const texto = await fs.promises.readFile(caminhoStatus(jobId), 'utf8');
+        return JSON.parse(texto);
+    } catch (e) {
+        return null;
+    }
+}
+
+// Remove jobs antigos para nao encher o disco. Roda a cada nova
+// requisicao de geracao (barato, poucos arquivos).
+async function limparJobsAntigos() {
+    try {
+        const arquivos = await fs.promises.readdir(DIR_JOBS);
+        const agora = Date.now();
+        for (const nome of arquivos) {
+            const completo = path.join(DIR_JOBS, nome);
+            try {
+                const info = await fs.promises.stat(completo);
+                if (agora - info.mtimeMs > JOB_VALIDADE_MS) {
+                    await fs.promises.unlink(completo).catch(function () { });
+                }
+            } catch (e) {
+                // ignora arquivo problematico
+            }
+        }
+    } catch (e) {
+        // pasta pode nao existir ainda - sem problema
+    }
+}
 
 // =========================================================================
 // LOGGER DE PROGRESSO + MEDIDOR DE MEMORIA
+//
+// Agora o log inclui o jobId, porque varias geracoes podem estar
+// acontecendo ao mesmo tempo e sem isso as linhas ficariam embaralhadas.
 // =========================================================================
-let _t0 = Date.now();
+const _cronometros = {};
 
-function iniciarCronometro() {
-    _t0 = Date.now();
+function iniciarCronometro(jobId) {
+    _cronometros[jobId] = Date.now();
+}
+
+function encerrarCronometro(jobId) {
+    delete _cronometros[jobId];
 }
 
 function mem() {
     return (process.memoryUsage().rss / 1024 / 1024).toFixed(0);
 }
 
-function log(etapa) {
-    const seg = ((Date.now() - _t0) / 1000).toFixed(1);
-    console.log('[' + seg + 's | ' + mem() + 'MB] ' + etapa);
+function log(jobId, etapa) {
+    const inicio = _cronometros[jobId] || Date.now();
+    const seg = ((Date.now() - inicio) / 1000).toFixed(1);
+    const curto = jobId ? jobId.substring(0, 8) : '--------';
+    console.log('[' + curto + ' | ' + seg + 's | ' + mem() + 'MB] ' + etapa);
 }
 
 // Sugere coleta de lixo (so funciona se o Node rodar com --expose-gc).
@@ -63,6 +136,16 @@ function liberarMemoria() {
         global.gc();
     }
 }
+
+// =========================================================================
+// OTIMIZACAO DE TEMPO - ESTRATEGIA DE ESPERA DO PUPPETEER
+//
+// O HTML gerado pelo Power Apps e 100% AUTOCONTIDO (imagens em base64
+// inline, nenhuma requisicao externa). Por isso 'domcontentloaded' basta:
+// o 'networkidle0' anterior apenas cobrava ~500ms a 2s por chamada
+// esperando uma rede que nunca teve atividade.
+// =========================================================================
+const ESPERA_RENDER = 'domcontentloaded';
 
 function mmParaPt(valorStr) {
     if (!valorStr) return 0;
@@ -140,27 +223,22 @@ function cabecalhoEstaVazio(headerHtmlProcessado) {
 // RENDERIZACAO - OTIMIZADA PARA BAIXO CONSUMO DE MEMORIA E TEMPO
 //
 // 1) UMA ABA (page) POR SEGMENTO, FECHADA LOGO APOS O USO.
-//    O Chromium mantem em memoria o layout da pagina anterior; fechando
-//    a aba, esse espaco e devolvido ao SO.
-//
 // 2) BUFFERS GRAVADOS EM DISCO (/tmp), NAO ACUMULADOS EM RAM.
-//
-// 3) waitUntil: ESPERA_RENDER ('domcontentloaded') em vez de
-//    'networkidle0' - ver explicacao no topo do arquivo.
+// 3) waitUntil: 'domcontentloaded' em vez de 'networkidle0'.
 // =========================================================================
-async function renderizarDocumento(browser, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens, prefixoTmp) {
+async function renderizarDocumento(jobId, browser, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens, prefixoTmp) {
     let temSegmentosPaisagem = false;
     let bufferFinal;
 
     if (!htmlContent.includes(LANDSCAPE_START)) {
-        log('    documento unico (sem paisagem) - abrindo aba...');
+        log(jobId, '    documento unico (sem paisagem) - abrindo aba...');
         const page = await browser.newPage();
         try {
             const htmlLimpo = removerMarcadoresDeLogo(htmlContent);
             await page.setContent(blocoGeometria + htmlLimpo, { waitUntil: ESPERA_RENDER, timeout: 120000 });
-            log('    HTML carregado - imprimindo PDF...');
+            log(jobId, '    HTML carregado - imprimindo PDF...');
             bufferFinal = await page.pdf(pdfOptionsRetrato);
-            log('    PDF impresso');
+            log(jobId, '    PDF impresso');
         } finally {
             await page.close();
             liberarMemoria();
@@ -168,7 +246,7 @@ async function renderizarDocumento(browser, htmlContent, blocoGeometria, pdfOpti
     } else {
         temSegmentosPaisagem = true;
         const segmentos = dividirEmSegmentos(htmlContent);
-        log('    documento com ' + segmentos.length + ' segmento(s) (retrato/paisagem)');
+        log(jobId, '    documento com ' + segmentos.length + ' segmento(s) (retrato/paisagem)');
 
         const arquivosTmp = [];
 
@@ -180,23 +258,22 @@ async function renderizarDocumento(browser, htmlContent, blocoGeometria, pdfOpti
                 continue;
             }
 
-            // Aba nova e exclusiva para este segmento
             const page = await browser.newPage();
             let buffer;
 
             try {
                 if (seg.tipo === 'retrato') {
-                    log('    ' + rotulo + ' - carregando...');
+                    log(jobId, '    ' + rotulo + ' - carregando...');
                     const htmlRetratoLimpo = removerMarcadoresDeLogo(seg.html);
                     await page.setContent(blocoGeometria + htmlRetratoLimpo, { waitUntil: ESPERA_RENDER, timeout: 120000 });
-                    log('    ' + rotulo + ' - imprimindo...');
+                    log(jobId, '    ' + rotulo + ' - imprimindo...');
                     buffer = await page.pdf(pdfOptionsRetrato);
                 } else {
-                    log('    ' + rotulo + ' - carregando...');
+                    log(jobId, '    ' + rotulo + ' - carregando...');
                     const conteudoComCabecalho = ehTemplateSiemens ? injetarCabecalhoPaisagem(seg.html) : removerMarcadoresDeLogo(seg.html);
                     let docPaisagem = '<!DOCTYPE html><html><head><meta charset="utf-8"><style>html, body { margin: 0; padding: 0; } table { max-width: 100% !important; } th, td { overflow-wrap: break-word; word-wrap: break-word; }</style></head><body>' + conteudoComCabecalho + '</body></html>';
                     await page.setContent(docPaisagem, { waitUntil: ESPERA_RENDER, timeout: 120000 });
-                    log('    ' + rotulo + ' - imprimindo...');
+                    log(jobId, '    ' + rotulo + ' - imprimindo...');
                     buffer = await page.pdf(pdfOptionsPaisagem);
                 }
             } finally {
@@ -205,29 +282,27 @@ async function renderizarDocumento(browser, htmlContent, blocoGeometria, pdfOpti
                 await page.close();
             }
 
-            // Grava em disco e solta a referencia da RAM
             const caminho = path.join(os.tmpdir(), prefixoTmp + '_seg' + i + '.pdf');
             await fs.promises.writeFile(caminho, buffer);
             arquivosTmp.push(caminho);
             buffer = null;
             liberarMemoria();
 
-            log('    ' + rotulo + ' OK (salvo em disco)');
+            log(jobId, '    ' + rotulo + ' OK (salvo em disco)');
         }
 
-        log('    juntando ' + arquivosTmp.length + ' arquivo(s) em um PDF unico...');
+        log(jobId, '    juntando ' + arquivosTmp.length + ' arquivo(s) em um PDF unico...');
         const pdfFinal = await PDFDocument.create();
         for (const caminho of arquivosTmp) {
             const buf = await fs.promises.readFile(caminho);
             const src = await PDFDocument.load(buf);
             const paginasCopiadas = await pdfFinal.copyPages(src, src.getPageIndices());
             paginasCopiadas.forEach(function (p) { pdfFinal.addPage(p); });
-            // Remove o temporario assim que ele ja foi absorvido
             await fs.promises.unlink(caminho).catch(function () { });
             liberarMemoria();
         }
         bufferFinal = Buffer.from(await pdfFinal.save());
-        log('    PDF unico montado');
+        log(jobId, '    PDF unico montado');
         liberarMemoria();
     }
 
@@ -238,10 +313,9 @@ async function renderizarDocumento(browser, htmlContent, blocoGeometria, pdfOpti
 // POS-PROCESSAMENTO UNIFICADO (rodape + indice)
 //
 // Uma unica leitura (pdfParse), um load e um save, com as duas correcoes
-// aplicadas no mesmo documento em memoria. A ordem das operacoes de
-// desenho e identica a anterior (rodape primeiro, indice depois).
+// aplicadas no mesmo documento em memoria.
 // =========================================================================
-async function posProcessarPDF(pdfBuffer, mapaDestinos, mLateralPt, corrigirRodape) {
+async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corrigirRodape) {
     const pagesItems = [];
 
     function custom_render_page(pageData) {
@@ -260,7 +334,7 @@ async function posProcessarPDF(pdfBuffer, mapaDestinos, mLateralPt, corrigirRoda
     }
 
     await pdfParse(pdfBuffer, { pagerender: custom_render_page });
-    log('    texto do PDF final extraido (' + pagesItems.length + ' paginas)');
+    log(jobId, '    texto do PDF final extraido (' + pagesItems.length + ' paginas)');
 
     const pdfDoc = await PDFDocument.load(pdfBuffer);
     const pages = pdfDoc.getPages();
@@ -296,7 +370,7 @@ async function posProcessarPDF(pdfBuffer, mapaDestinos, mLateralPt, corrigirRoda
             pagina.drawText('FOLHA: ' + (i + 1) + ' de ' + totalPaginas, { x: minX, y: baseY, size: fontSize, font: fonteBold, color: rgb(0, 0, 0) });
             corrigidas++;
         }
-        log('    rodape corrigido em ' + corrigidas + ' pagina(s)');
+        log(jobId, '    rodape corrigido em ' + corrigidas + ' pagina(s)');
     }
 
     // ---------------------------------------------------------------
@@ -364,13 +438,11 @@ async function posProcessarPDF(pdfBuffer, mapaDestinos, mLateralPt, corrigirRoda
                 const fonteEscolhida = (numUnderscores === 1) ? fonteBold : fonteNormal;
 
                 // Margem vertical de 6pt garante que o pontilhado original
-                // (border-bottom do CSS) seja totalmente coberto - com
-                // margem menor sobrava uma tira fina do estilo antigo.
+                // (border-bottom do CSS) seja totalmente coberto.
                 const rowTop = numItem.y - 6;
                 const rowBottom = numItem.y + alturaFonte + 6;
                 const rowHeight = rowBottom - rowTop;
 
-                // Apaga do fim do titulo ate a borda fisica da pagina
                 const whiteFromX = oc.titleEndX + 2;
                 paginaOrigem.drawRectangle({
                     x: whiteFromX,
@@ -380,7 +452,6 @@ async function posProcessarPDF(pdfBuffer, mapaDestinos, mLateralPt, corrigirRoda
                     color: rgb(1, 1, 1)
                 });
 
-                // Redesenha o pontilhado inteiro, de um so estilo
                 const dotY = numItem.y - 1.5;
                 const dotsFromX = oc.titleEndX + 4;
                 const dotsToX = novoX - 3;
@@ -437,41 +508,38 @@ async function posProcessarPDF(pdfBuffer, mapaDestinos, mLateralPt, corrigirRoda
             linksCriados++;
         });
 
-        log('    indice: ' + linksCriados + ' link(s) criado(s)');
+        log(jobId, '    indice: ' + linksCriados + ' link(s) criado(s)');
     }
 
-    // Libera a lista de posicoes antes de serializar o PDF
     pagesItems.length = 0;
     liberarMemoria();
 
     return Buffer.from(await pdfDoc.save());
 }
 
-app.post('/gerar-pdf', async (req, res) => {
+// =========================================================================
+// PROCESSAMENTO EM SEGUNDO PLANO
+//
+// Esta funcao NAO e aguardada (sem await) pelo endpoint POST /gerar-pdf.
+// Ela roda por conta propria e vai atualizando o arquivo de status do job.
+// Por isso, todo o corpo precisa estar dentro de try/catch: um erro nao
+// tratado aqui derrubaria o processo inteiro do Node, ja que nao existe
+// ninguem "acima" para capturar a excecao.
+// =========================================================================
+async function processarJob(jobId, parametros) {
     let browser;
-
-    iniciarCronometro();
-    log('===== NOVA REQUISICAO RECEBIDA =====');
-
-    // Prefixo unico para os arquivos temporarios desta requisicao,
-    // evitando colisao caso duas execucoes rodem ao mesmo tempo
-    const prefixoTmp = 'fpt_' + Date.now() + '_' + Math.floor(Math.random() * 10000);
+    const prefixoTmp = 'fpt_' + jobId;
 
     try {
-        if (!req.body || typeof req.body.html !== 'string' || req.body.html.trim() === '') {
-            log('ERRO: campo html ausente ou vazio');
-            return res.status(400).json({ erro: "O campo 'html' é obrigatório e deve ser um texto não vazio." });
-        }
+        let htmlContent = parametros.html;
+        log(jobId, 'HTML recebido: ' + (htmlContent.length / 1024).toFixed(0) + ' KB');
 
-        let htmlContent = req.body.html;
-        log('HTML recebido: ' + (htmlContent.length / 1024).toFixed(0) + ' KB');
-
-        const headerRaw = req.body.cabecalho || '<div></div>';
-        const footerRaw = req.body.rodape || '<div></div>';
-        const mTop = req.body.margemTop || '10mm';
-        const mBottom = req.body.margemBottom || '55mm';
-        const mLateral = req.body.margemLateral || '15mm';
-        const tamanhoPapel = req.body.tamanhoPapel || 'A4';
+        const headerRaw = parametros.cabecalho || '<div></div>';
+        const footerRaw = parametros.rodape || '<div></div>';
+        const mTop = parametros.margemTop || '10mm';
+        const mBottom = parametros.margemBottom || '55mm';
+        const mLateral = parametros.margemLateral || '15mm';
+        const tamanhoPapel = parametros.tamanhoPapel || 'A4';
 
         const headerHtml = headerRaw.split('[MARGEM_LATERAL]').join(mLateral);
         const footerHtml = footerRaw.split('[MARGEM_LATERAL]').join(mLateral);
@@ -498,7 +566,9 @@ app.post('/gerar-pdf', async (req, res) => {
             timeout: 120000
         };
 
-        log('Iniciando navegador (Puppeteer)...');
+        await gravarStatus(jobId, { status: 'PROCESSANDO', etapa: 'Iniciando navegador' });
+        log(jobId, 'Iniciando navegador (Puppeteer)...');
+
         browser = await puppeteer.launch({
             headless: 'new',
             executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
@@ -508,7 +578,6 @@ app.post('/gerar-pdf', async (req, res) => {
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
                 '--no-zygote',
-                // Flags adicionais para reduzir o consumo de RAM do Chromium
                 '--disable-extensions',
                 '--disable-background-networking',
                 '--disable-background-timer-throttling',
@@ -523,33 +592,34 @@ app.post('/gerar-pdf', async (req, res) => {
                 '--disable-features=site-per-process,TranslateUI'
             ]
         });
-        log('Navegador iniciado');
+        log(jobId, 'Navegador iniciado');
 
         const mapaDestinos = {};
 
         if (htmlContent.includes('#ANC_')) {
-            log('ETAPA 1/4 - Renderizando PDF fantasma (para calcular as paginas do indice)...');
-            const htmlFantasma = htmlContent.replace(/\{\{PAG_CAP_[A-Za-z0-9_]+\}\}/g, '000');
-            const resultadoFantasma = await renderizarDocumento(browser, htmlFantasma, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens, prefixoTmp + '_ghost');
-            log('ETAPA 1/4 - PDF fantasma pronto');
+            await gravarStatus(jobId, { status: 'PROCESSANDO', etapa: 'Calculando paginas do indice (1/4)' });
+            log(jobId, 'ETAPA 1/4 - Renderizando PDF fantasma (para calcular as paginas do indice)...');
 
-            log('ETAPA 2/4 - Extraindo texto do PDF fantasma (pdf-parse)...');
+            const htmlFantasma = htmlContent.replace(/\{\{PAG_CAP_[A-Za-z0-9_]+\}\}/g, '000');
+            const resultadoFantasma = await renderizarDocumento(jobId, browser, htmlFantasma, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens, prefixoTmp + '_ghost');
+            log(jobId, 'ETAPA 1/4 - PDF fantasma pronto');
+
+            await gravarStatus(jobId, { status: 'PROCESSANDO', etapa: 'Lendo estrutura do documento (2/4)' });
+            log(jobId, 'ETAPA 2/4 - Extraindo texto do PDF fantasma (pdf-parse)...');
             const pdfData = await pdfParse(resultadoFantasma.buffer, { pagerender: render_page });
 
-            // Solta o PDF fantasma da memoria IMEDIATAMENTE apos extrair o
-            // texto - ele nao e mais necessario.
             resultadoFantasma.buffer = null;
             liberarMemoria();
 
             const pages = pdfData.text.split('\n---PAGE_BREAK---\n');
-            log('ETAPA 2/4 - Texto extraido de ' + pages.length + ' pagina(s)');
+            log(jobId, 'ETAPA 2/4 - Texto extraido de ' + pages.length + ' pagina(s)');
 
             const pagesNormalizadas = pages.map(function (p) { return normalizarAncora(p); });
             const anchors = htmlContent.match(/#ANC_[A-Za-z0-9_]+#/g);
 
             if (anchors) {
                 const uniqueAnchors = [...new Set(anchors)];
-                log('Mapeando ' + uniqueAnchors.length + ' ancora(s) unica(s)...');
+                log(jobId, 'Mapeando ' + uniqueAnchors.length + ' ancora(s) unica(s)...');
                 uniqueAnchors.forEach(function (anchor) {
                     const pureAnchor = normalizarAncora(anchor);
                     const pageNum = pagesNormalizadas.findIndex(function (pText) { return pText.includes(pureAnchor); }) + 1;
@@ -563,37 +633,34 @@ app.post('/gerar-pdf', async (req, res) => {
                         htmlContent = htmlContent.split(placeholder).join(pageNumFormatado + marcadorHtml);
                         mapaDestinos[codigo] = pageNum;
                     } else {
-                        log('  AVISO: ancora ' + codigo + ' NAO encontrada no PDF (vai sair como ---)');
+                        log(jobId, '  AVISO: ancora ' + codigo + ' NAO encontrada no PDF (vai sair como ---)');
                     }
                     htmlContent = htmlContent.split(anchor).join('');
                 });
-                log('Ancoras mapeadas: ' + Object.keys(mapaDestinos).length + ' de ' + uniqueAnchors.length);
+                log(jobId, 'Ancoras mapeadas: ' + Object.keys(mapaDestinos).length + ' de ' + uniqueAnchors.length);
             }
 
             const orfaos = htmlContent.match(/\{\{PAG_[A-Za-z0-9_]+\}\}/g);
             if (orfaos) {
                 const listaOrfaos = [...new Set(orfaos)];
-                log('Substituindo ' + listaOrfaos.length + ' placeholder(s) orfao(s) por "---"');
+                log(jobId, 'Substituindo ' + listaOrfaos.length + ' placeholder(s) orfao(s) por "---"');
                 listaOrfaos.forEach(function (o) { htmlContent = htmlContent.split(o).join('---'); });
             }
 
-            // Libera os textos extraidos (podem somar varios MB em
-            // documentos de ~100 paginas) antes da renderizacao final
             pages.length = 0;
             pagesNormalizadas.length = 0;
             pdfData.text = '';
             liberarMemoria();
         }
 
-        log('ETAPA 3/4 - Renderizando PDF final...');
-        const resultadoFinal = await renderizarDocumento(browser, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens, prefixoTmp + '_final');
-        let finalPdfBuffer = resultadoFinal.buffer;
-        log('ETAPA 3/4 - PDF final pronto (' + (finalPdfBuffer.length / 1024 / 1024).toFixed(1) + ' MB)');
+        await gravarStatus(jobId, { status: 'PROCESSANDO', etapa: 'Montando o documento final (3/4)' });
+        log(jobId, 'ETAPA 3/4 - Renderizando PDF final...');
 
-        // Fecha o navegador ANTES do pos-processamento: a partir daqui so
-        // se trabalha com pdf-lib, e manter o Chromium vivo seria puro
-        // desperdicio de memoria no momento mais critico.
-        log('Fechando navegador (nao e mais necessario)...');
+        const resultadoFinal = await renderizarDocumento(jobId, browser, htmlContent, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens, prefixoTmp + '_final');
+        let finalPdfBuffer = resultadoFinal.buffer;
+        log(jobId, 'ETAPA 3/4 - PDF final pronto (' + (finalPdfBuffer.length / 1024 / 1024).toFixed(1) + ' MB)');
+
+        log(jobId, 'Fechando navegador (nao e mais necessario)...');
         await browser.close();
         browser = null;
         liberarMemoria();
@@ -602,33 +669,41 @@ app.post('/gerar-pdf', async (req, res) => {
         const precisaIndice = Object.keys(mapaDestinos).length > 0;
 
         if (precisaRodape || precisaIndice) {
-            log('ETAPA 4/4 - Pos-processamento (rodape + indice em uma unica passagem)...');
+            await gravarStatus(jobId, { status: 'PROCESSANDO', etapa: 'Ajustando indice e numeracao (4/4)' });
+            log(jobId, 'ETAPA 4/4 - Pos-processamento (rodape + indice em uma unica passagem)...');
             const mLateralPt = mmParaPt(mLateral);
-            finalPdfBuffer = await posProcessarPDF(finalPdfBuffer, precisaIndice ? mapaDestinos : null, mLateralPt, precisaRodape);
-            log('ETAPA 4/4 - Pos-processamento concluido');
+            finalPdfBuffer = await posProcessarPDF(jobId, finalPdfBuffer, precisaIndice ? mapaDestinos : null, mLateralPt, precisaRodape);
+            log(jobId, 'ETAPA 4/4 - Pos-processamento concluido');
         } else {
-            log('ETAPA 4/4 - Pulada (nada a corrigir)');
+            log(jobId, 'ETAPA 4/4 - Pulada (nada a corrigir)');
         }
 
-        log('Convertendo para base64 e enviando resposta...');
-        const base64 = finalPdfBuffer.toString('base64');
+        // Grava o PDF pronto em disco e marca o job como concluido
+        await fs.promises.writeFile(caminhoPdf(jobId), finalPdfBuffer);
+        const tamanhoMb = (finalPdfBuffer.length / 1024 / 1024).toFixed(2);
         finalPdfBuffer = null;
         liberarMemoria();
 
-        res.json({ pdfBase64: base64 });
-        log('===== CONCLUIDO COM SUCESSO =====');
+        await gravarStatus(jobId, {
+            status: 'CONCLUIDO',
+            etapa: 'Pronto para download',
+            tamanhoMB: tamanhoMb
+        });
+        log(jobId, '===== CONCLUIDO COM SUCESSO (' + tamanhoMb + ' MB) =====');
 
     } catch (error) {
-        log('===== ERRO FATAL =====');
-        console.error("🚨 Erro Fatal:", error);
-        res.status(500).json({ erro: error.toString() });
+        log(jobId, '===== ERRO FATAL =====');
+        console.error('🚨 Erro no job ' + jobId + ':', error);
+        await gravarStatus(jobId, {
+            status: 'ERRO',
+            etapa: 'Falhou',
+            erro: String(error && error.message ? error.message : error)
+        }).catch(function () { });
     } finally {
         if (browser) {
-            await browser.close();
-            log('Navegador fechado');
+            await browser.close().catch(function () { });
         }
-        // Limpeza de seguranca: remove qualquer temporario que tenha
-        // sobrado (por exemplo, se a requisicao falhou no meio)
+        // Remove os arquivos temporarios de segmento deste job
         try {
             const arquivos = await fs.promises.readdir(os.tmpdir());
             for (const nome of arquivos) {
@@ -639,9 +714,131 @@ app.post('/gerar-pdf', async (req, res) => {
         } catch (e) {
             // silencioso - limpeza e best-effort
         }
+        encerrarCronometro(jobId);
         liberarMemoria();
+    }
+}
+
+// =========================================================================
+// ENDPOINT 1 - INICIAR A GERACAO
+//
+// Responde IMEDIATAMENTE (202 Accepted) com o jobId. O trabalho pesado
+// acontece depois, em segundo plano. E isso que elimina o teto de 120s
+// do conector HTTP do Power Automate.
+// =========================================================================
+app.post('/gerar-pdf', async (req, res) => {
+    if (!req.body || typeof req.body.html !== 'string' || req.body.html.trim() === '') {
+        return res.status(400).json({ erro: "O campo 'html' é obrigatório e deve ser um texto não vazio." });
+    }
+
+    const jobId = crypto.randomUUID();
+    iniciarCronometro(jobId);
+    log(jobId, '===== NOVO JOB RECEBIDO =====');
+
+    // Faxina de jobs vencidos (nao bloqueia a resposta)
+    limparJobsAntigos().catch(function () { });
+
+    try {
+        await gravarStatus(jobId, { status: 'PROCESSANDO', etapa: 'Na fila' });
+    } catch (e) {
+        log(jobId, 'ERRO ao criar o arquivo de status: ' + e.message);
+        return res.status(500).json({ erro: 'Nao foi possivel registrar o job: ' + e.message });
+    }
+
+    // Copia os parametros ANTES de responder, porque o objeto req pode
+    // ser reciclado pelo Express depois que a resposta e enviada.
+    const parametros = {
+        html: req.body.html,
+        cabecalho: req.body.cabecalho,
+        rodape: req.body.rodape,
+        margemTop: req.body.margemTop,
+        margemBottom: req.body.margemBottom,
+        margemLateral: req.body.margemLateral,
+        tamanhoPapel: req.body.tamanhoPapel
+    };
+
+    // Responde na hora - o Power Automate segue a vida
+    res.status(202).json({ jobId: jobId, status: 'PROCESSANDO' });
+
+    // Dispara o trabalho pesado SEM await (proposital).
+    // O .catch e uma rede de seguranca extra: processarJob ja trata os
+    // proprios erros internamente, mas se algo escapar, isso impede que
+    // uma "unhandled rejection" derrube o processo do Node.
+    processarJob(jobId, parametros).catch(function (err) {
+        console.error('Falha nao tratada no job ' + jobId + ':', err);
+    });
+});
+
+// =========================================================================
+// ENDPOINT 2 - CONSULTAR O ANDAMENTO
+//
+// Resposta pequena e rapida (JSON de poucos bytes). E este endpoint que o
+// Power Apps consulta em loop, a cada 10 segundos.
+// =========================================================================
+app.get('/status/:jobId', async (req, res) => {
+    const jobId = req.params.jobId;
+    const registro = await lerStatus(jobId);
+
+    if (!registro) {
+        return res.status(404).json({
+            status: 'NAO_ENCONTRADO',
+            erro: 'Job inexistente ou ja expirado (os jobs sao mantidos por 30 minutos).'
+        });
+    }
+
+    res.json(registro);
+});
+
+// =========================================================================
+// ENDPOINT 3 - BAIXAR O PDF PRONTO
+//
+// Devolve o arquivo em base64, no mesmo formato que a versao anterior
+// retornava - assim o "Create file" do Power Automate continua usando
+// base64ToBinary(body('HTTP')?['pdfBase64']) sem alteracao.
+// =========================================================================
+app.get('/download/:jobId', async (req, res) => {
+    const jobId = req.params.jobId;
+    const registro = await lerStatus(jobId);
+
+    if (!registro) {
+        return res.status(404).json({ erro: 'Job inexistente ou ja expirado.' });
+    }
+    if (registro.status === 'ERRO') {
+        return res.status(500).json({ erro: registro.erro || 'O job terminou com erro.' });
+    }
+    if (registro.status !== 'CONCLUIDO') {
+        return res.status(409).json({
+            status: registro.status,
+            etapa: registro.etapa,
+            erro: 'O PDF ainda nao esta pronto.'
+        });
+    }
+
+    try {
+        const buffer = await fs.promises.readFile(caminhoPdf(jobId));
+        res.json({ pdfBase64: buffer.toString('base64') });
+    } catch (e) {
+        res.status(500).json({ erro: 'Arquivo do PDF nao encontrado no servidor: ' + e.message });
     }
 });
 
+// =========================================================================
+// ENDPOINT 4 - LIBERAR O JOB (opcional)
+//
+// Chamado pelo fluxo depois de salvar o PDF no SharePoint, para devolver
+// o espaco em disco sem esperar os 30 minutos de validade.
+// =========================================================================
+app.delete('/job/:jobId', async (req, res) => {
+    const jobId = req.params.jobId;
+    await fs.promises.unlink(caminhoStatus(jobId)).catch(function () { });
+    await fs.promises.unlink(caminhoPdf(jobId)).catch(function () { });
+    res.json({ removido: true, jobId: jobId });
+});
+
+// Endpoint simples para verificar se o servico esta no ar
+app.get('/', (req, res) => {
+    res.json({ servico: 'API PDF FPT', modo: 'assincrono', memoriaMB: mem() });
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Ativo na porta ' + PORT));
+app.listen(PORT, () => console.log('Ativo na porta ' + PORT + ' (modo assincrono)'));
