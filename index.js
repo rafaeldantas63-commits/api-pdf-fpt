@@ -6,6 +6,14 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+// Otimizador de fotos (opcional): se o arquivo ou a biblioteca 'sharp' nao existirem,
+// o servidor continua funcionando exatamente como antes.
+let otimizarImagensHtml = null;
+try {
+    otimizarImagensHtml = require('./otimizar_imagens').otimizarImagensHtml;
+} catch (e) {
+    console.warn('Otimizador de fotos indisponivel (' + e.message + '). Seguindo sem otimizar.');
+}
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -533,6 +541,16 @@ async function processarJob(jobId, parametros) {
     try {
         let htmlContent = parametros.html;
         log(jobId, 'HTML recebido: ' + (htmlContent.length / 1024).toFixed(0) + ' KB');
+        // Reduz as fotos marcadas com data-opt (somente o relatorio de pendencias envia essa marca)
+        if (otimizarImagensHtml && htmlContent.indexOf('data-opt') !== -1) {
+            try {
+                const otim = await otimizarImagensHtml(htmlContent);
+                htmlContent = otim.html;
+                log(jobId, 'Fotos otimizadas: ' + otim.trocadas + ' reduzida(s) | ' + (otim.antes / 1024 / 1024).toFixed(1) + ' MB -> ' + (otim.depois / 1024 / 1024).toFixed(1) + ' MB | HTML agora: ' + (htmlContent.length / 1024).toFixed(0) + ' KB');
+            } catch (e) {
+                log(jobId, 'AVISO: otimizacao de fotos falhou, seguindo com o HTML original: ' + e.message);
+            }
+        }
 
         const headerRaw = parametros.cabecalho || '<div></div>';
         const footerRaw = parametros.rodape || '<div></div>';
