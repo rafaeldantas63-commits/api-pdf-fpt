@@ -369,7 +369,14 @@ async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corri
 
         for (let i = paginasCapa; i < pagesItems.length && i < pages.length; i++) {
             const items = pagesItems[i];
-            const idxMarcador = items.findIndex(function (it) { return /FOLHA\s*:?/i.test(it.str); });
+            // O marcador "FOLHA" do RODAPE e o item mais baixo da pagina. A palavra "folha" pode aparecer
+            // tambem no corpo do texto (ex.: "assinar a folha de instrucoes"), entao nao basta pegar a
+            // primeira ocorrencia: pega-se a que tem o menor Y (a mais proxima da borda inferior).
+            const idxMarcador = items.reduce(function (melhor, it, k) {
+                if (!/FOLHA\s*:?/i.test(it.str)) return melhor;
+                if (melhor === -1 || it.y < items[melhor].y) return k;
+                return melhor;
+            }, -1);
             if (idxMarcador === -1) continue;
 
             const baseY = items[idxMarcador].y;
@@ -741,7 +748,7 @@ async function processarJob(jobId, parametros) {
 
     } catch (error) {
         log(jobId, '===== ERRO FATAL =====');
-        console.error('ðŸš¨ Erro no job ' + jobId + ':', error);
+        console.error('ERRO no job ' + jobId + ':', error);
         await gravarStatus(jobId, {
             status: 'ERRO',
             etapa: 'Falhou',
@@ -776,7 +783,7 @@ async function processarJob(jobId, parametros) {
 // =========================================================================
 app.post('/gerar-pdf', async (req, res) => {
     if (!req.body || typeof req.body.html !== 'string' || req.body.html.trim() === '') {
-        return res.status(400).json({ erro: "O campo 'html' Ã© obrigatÃ³rio e deve ser um texto nÃ£o vazio." });
+        return res.status(400).json({ erro: "O campo 'html' e obrigatorio e deve ser um texto nao vazio." });
     }
 
     const jobId = crypto.randomUUID();
