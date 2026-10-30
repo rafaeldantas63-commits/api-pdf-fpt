@@ -23,6 +23,15 @@ try {
 } catch (e) {
     console.warn('Modulo de capa indisponivel (' + e.message + '). Seguindo sem capa isolada.');
 }
+
+// Anexos no fim do documento (opcional): se o arquivo anexos.js nao existir, o servidor
+// continua funcionando exatamente como antes (sem anexos).
+let anexosApi = null;
+try {
+    anexosApi = require('./anexos');
+} catch (e) {
+    console.warn('Modulo de anexos indisponivel (' + e.message + '). Seguindo sem anexos.');
+}
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
@@ -235,6 +244,12 @@ function cabecalhoEstaVazio(headerHtmlProcessado) {
     return semEspacos === '<div></div>' || semEspacos === '';
 }
 
+// Conta as paginas de um PDF (usado para conferir se o corpo mudou de tamanho entre a passagem de calculo e a final)
+async function contarPaginasPdf(pdfBuffer) {
+    const doc = await PDFDocument.load(pdfBuffer);
+    return doc.getPageCount();
+}
+
 // =========================================================================
 // RENDERIZACAO - OTIMIZADA PARA BAIXO CONSUMO DE MEMORIA E TEMPO
 //
@@ -331,9 +346,11 @@ async function renderizarDocumento(jobId, browser, htmlContent, blocoGeometria, 
 // Uma unica leitura (pdfParse), um load e um save, com as duas correcoes
 // aplicadas no mesmo documento em memoria.
 // =========================================================================
-async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corrigirRodape, paginasCapa) {
+async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corrigirRodape, paginasCapa, paginasExtras) {
     // paginasCapa: quantas paginas iniciais sao a capa isolada (nao entram na renumeracao do rodape)
     paginasCapa = paginasCapa || 0;
+    // paginasExtras: paginas que serao coladas DEPOIS (anexos) e ja contam no total "FOLHA: x de N"
+    paginasExtras = paginasExtras || 0;
     const pagesItems = [];
 
     function custom_render_page(pageData) {
@@ -364,7 +381,7 @@ async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corri
     // PARTE 1 - NUMERACAO DO RODAPE ("FOLHA: X de Y")
     // ---------------------------------------------------------------
     if (corrigirRodape) {
-        const totalPaginas = pdfDoc.getPageCount();
+        const totalPaginas = pdfDoc.getPageCount() + paginasExtras;
         let corrigidas = 0;
 
         for (let i = paginasCapa; i < pagesItems.length && i < pages.length; i++) {
@@ -578,6 +595,27 @@ async function processarJob(jobId, parametros) {
             log(jobId, 'Capa isolada detectada (' + (capa.capaHtml.length / 1024).toFixed(0) + ' KB)');
         }
 
+        // ANEXOS: se o HTML trouxer <!--ANEXOS:lote-->, os PDFs enviados antes para esse lote
+        // (POST /anexos/:lote) sao colados no fim do documento. Sem o marcador, nada muda.
+        const avisos = [];
+        let anexosInfo = null;
+        if (anexosApi) {
+            const marc = anexosApi.extrairMarcador(htmlContent);
+            htmlContent = marc.htmlSemMarcador;
+            if (marc.lote) {
+                anexosInfo = await anexosApi.carregar(marc.lote);
+                if (!anexosInfo) {
+                    avisos.push('Nenhum anexo encontrado no lote ' + marc.lote + ': o PDF saiu sem os certificados.');
+                    log(jobId, 'AVISO: lote de anexos "' + marc.lote + '" vazio ou inexistente');
+                } else {
+                    log(jobId, 'Anexos: ' + anexosInfo.unicos.length + ' arquivo(s) unico(s), ' + anexosInfo.totalPaginas + ' pagina(s) (' + (anexosInfo.itens.length - anexosInfo.unicos.length) + ' repetido(s) ignorado(s))');
+                }
+            }
+        }
+        const temAnexos = !!anexosInfo;
+        const paginasAnexos = temAnexos ? anexosInfo.totalPaginas : 0;
+        let paginasCorpoCalculadas = null;
+
         const headerRaw = parametros.cabecalho || '<div></div>';
         const footerRaw = parametros.rodape || '<div></div>';
         const mTop = parametros.margemTop || '10mm';
@@ -640,11 +678,14 @@ async function processarJob(jobId, parametros) {
 
         const mapaDestinos = {};
 
-        if (htmlContent.includes('#ANC_')) {
+        // A passagem de calculo (PDF fantasma) roda quando ha ancoras de indice (#ANC_)
+        // ou quando ha folhas de anexos a preencher ({{PAG_ANX_...}}).
+        const temFolhasAnexos = temAnexos && /\{\{PAG_ANX_[A-Za-z0-9_-]+\}\}/.test(htmlContent);
+        if (htmlContent.includes('#ANC_') || temFolhasAnexos) {
             await gravarStatus(jobId, { status: 'PROCESSANDO', etapa: 'Calculando paginas do indice (1/4)' });
             log(jobId, 'ETAPA 1/4 - Renderizando PDF fantasma (para calcular as paginas do indice)...');
 
-            const htmlFantasma = htmlContent.replace(/\{\{PAG_CAP_[A-Za-z0-9_]+\}\}/g, '000');
+            const htmlFantasma = htmlContent.replace(/\{\{PAG_(?:CAP|ANX)_[A-Za-z0-9_-]+\}\}/g, '000');
             const resultadoFantasma = await renderizarDocumento(jobId, browser, htmlFantasma, blocoGeometria, pdfOptionsRetrato, pdfOptionsPaisagem, ehTemplateSiemens, prefixoTmp + '_ghost');
             log(jobId, 'ETAPA 1/4 - PDF fantasma pronto');
 
@@ -686,6 +727,14 @@ async function processarJob(jobId, parametros) {
                 log(jobId, 'Ancoras mapeadas: ' + Object.keys(mapaDestinos).length + ' de ' + uniqueAnchors.length);
             }
 
+            // Folhas dos anexos: os certificados comecam logo depois do corpo (e da capa, se houver)
+            if (temAnexos) {
+                paginasCorpoCalculadas = pdfData.numpages;
+                const antes = pdfData.numpages + (temCapa ? capaApi.CAPA_PAGINAS : 0);
+                htmlContent = anexosApi.preencherFolhas(htmlContent, anexosInfo, antes);
+                log(jobId, 'Anexos: corpo com ' + pdfData.numpages + ' pagina(s); os anexos comecam na folha ' + (antes + 1));
+            }
+
             const orfaos = htmlContent.match(/\{\{PAG_[A-Za-z0-9_]+\}\}/g);
             if (orfaos) {
                 const listaOrfaos = [...new Set(orfaos)];
@@ -699,6 +748,9 @@ async function processarJob(jobId, parametros) {
             liberarMemoria();
         }
 
+        // Folha de anexo sem passagem de calculo (ou sem anexo para o equipamento): nunca deixa "{{...}}" no PDF
+        htmlContent = htmlContent.replace(/\{\{PAG_ANX_[A-Za-z0-9_-]+\}\}/g, '---');
+
         await gravarStatus(jobId, { status: 'PROCESSANDO', etapa: 'Montando o documento final (3/4)' });
         log(jobId, 'ETAPA 3/4 - Renderizando PDF final...');
 
@@ -706,9 +758,19 @@ async function processarJob(jobId, parametros) {
         let finalPdfBuffer = resultadoFinal.buffer;
         log(jobId, 'ETAPA 3/4 - PDF final pronto (' + (finalPdfBuffer.length / 1024 / 1024).toFixed(1) + ' MB)');
 
+        // Conferencia: o corpo final tem o mesmo numero de paginas da passagem de calculo?
+        // Se mudou, as folhas escritas na tabela dos anexos podem estar deslocadas.
+        if (temAnexos && paginasCorpoCalculadas !== null) {
+            const corpoFinal = await contarPaginasPdf(finalPdfBuffer);
+            if (corpoFinal !== paginasCorpoCalculadas) {
+                avisos.push('O corpo do documento mudou de ' + paginasCorpoCalculadas + ' para ' + corpoFinal + ' pagina(s) entre o calculo e a geracao final: confira as folhas da tabela dos anexos.');
+                log(jobId, 'AVISO: corpo mudou de tamanho (' + paginasCorpoCalculadas + ' -> ' + corpoFinal + ')');
+            }
+        }
+
         // CAPA ISOLADA: renderiza a capa (sem cabecalho/rodape/margem) e coloca na frente do corpo
         if (temCapa) {
-            const totalFolhas = (await capaApi.contarPaginas(finalPdfBuffer)) + capaApi.CAPA_PAGINAS;
+            const totalFolhas = (await capaApi.contarPaginas(finalPdfBuffer)) + capaApi.CAPA_PAGINAS + paginasAnexos;
             log(jobId, 'Renderizando a capa isolada (folha 1 de ' + totalFolhas + ')...');
             const capaBuffer = await capaApi.renderizarCapa(browser, capa.capaHtml, totalFolhas);
             finalPdfBuffer = await capaApi.anexarCapa(finalPdfBuffer, capaBuffer);
@@ -720,17 +782,26 @@ async function processarJob(jobId, parametros) {
         browser = null;
         liberarMemoria();
 
-        const precisaRodape = resultadoFinal.temSegmentosPaisagem || temCapa;
+        const precisaRodape = resultadoFinal.temSegmentosPaisagem || temCapa || temAnexos;
         const precisaIndice = Object.keys(mapaDestinos).length > 0;
 
         if (precisaRodape || precisaIndice) {
             await gravarStatus(jobId, { status: 'PROCESSANDO', etapa: 'Ajustando indice e numeracao (4/4)' });
             log(jobId, 'ETAPA 4/4 - Pos-processamento (rodape + indice em uma unica passagem)...');
             const mLateralPt = mmParaPt(mLateral);
-            finalPdfBuffer = await posProcessarPDF(jobId, finalPdfBuffer, precisaIndice ? mapaDestinos : null, mLateralPt, precisaRodape, temCapa ? capaApi.CAPA_PAGINAS : 0);
+            finalPdfBuffer = await posProcessarPDF(jobId, finalPdfBuffer, precisaIndice ? mapaDestinos : null, mLateralPt, precisaRodape, temCapa ? capaApi.CAPA_PAGINAS : 0, paginasAnexos);
             log(jobId, 'ETAPA 4/4 - Pos-processamento concluido');
         } else {
             log(jobId, 'ETAPA 4/4 - Pulada (nada a corrigir)');
+        }
+
+        // ANEXOS: cola os certificados no fim, completos e sem alteracao
+        if (temAnexos) {
+            await gravarStatus(jobId, { status: 'PROCESSANDO', etapa: 'Anexando certificados' });
+            log(jobId, 'Anexando ' + anexosInfo.unicos.length + ' arquivo(s) (' + paginasAnexos + ' pagina(s)) ao fim do PDF...');
+            finalPdfBuffer = await anexosApi.anexar(finalPdfBuffer, anexosInfo);
+            log(jobId, 'Anexos colados (' + (finalPdfBuffer.length / 1024 / 1024).toFixed(1) + ' MB no total)');
+            liberarMemoria();
         }
 
         // Grava o PDF pronto em disco e marca o job como concluido
@@ -742,7 +813,8 @@ async function processarJob(jobId, parametros) {
         await gravarStatus(jobId, {
             status: 'CONCLUIDO',
             etapa: 'Pronto para download',
-            tamanhoMB: tamanhoMb
+            tamanhoMB: tamanhoMb,
+            avisos: avisos.length > 0 ? avisos : undefined
         });
         log(jobId, '===== CONCLUIDO COM SUCESSO (' + tamanhoMb + ' MB) =====');
 
@@ -790,8 +862,9 @@ app.post('/gerar-pdf', async (req, res) => {
     iniciarCronometro(jobId);
     log(jobId, '===== NOVO JOB RECEBIDO =====');
 
-    // Faxina de jobs vencidos (nao bloqueia a resposta)
+    // Faxina de jobs e de lotes de anexos vencidos (nao bloqueia a resposta)
     limparJobsAntigos().catch(function () { });
+    if (anexosApi) anexosApi.limparAntigos().catch(function () { });
 
     try {
         await gravarStatus(jobId, { status: 'PROCESSANDO', etapa: 'Na fila' });
@@ -888,6 +961,47 @@ app.delete('/job/:jobId', async (req, res) => {
     await fs.promises.unlink(caminhoStatus(jobId)).catch(function () { });
     await fs.promises.unlink(caminhoPdf(jobId)).catch(function () { });
     res.json({ removido: true, jobId: jobId });
+});
+
+// =========================================================================
+// ENDPOINTS 5, 6 e 7 - ANEXOS (certificados no fim do documento, Capitulo 9)
+//
+//   POST   /anexos/:lote  { nome, equipamento, ordem, base64 }  -> guarda um PDF no lote
+//   GET    /anexos/:lote                                        -> lista o que ja foi enviado
+//   DELETE /anexos/:lote                                        -> esvazia o lote (o fluxo faz isso antes de enviar)
+//
+// O lote e usado quando o HTML da geracao traz <!--ANEXOS:lote-->.
+// Lotes ficam 2 horas no disco e depois sao apagados sozinhos.
+// =========================================================================
+function responderErroAnexo(res, e) {
+    res.status(e && e.status ? e.status : 500).json({ erro: String(e && e.message ? e.message : e) });
+}
+
+app.post('/anexos/:lote', async (req, res) => {
+    if (!anexosApi) return res.status(501).json({ erro: 'Modulo de anexos indisponivel no servidor.' });
+    try {
+        res.json(await anexosApi.receberAnexo(req.params.lote, req.body || {}));
+    } catch (e) {
+        responderErroAnexo(res, e);
+    }
+});
+
+app.get('/anexos/:lote', async (req, res) => {
+    if (!anexosApi) return res.status(501).json({ erro: 'Modulo de anexos indisponivel no servidor.' });
+    try {
+        res.json(await anexosApi.listar(req.params.lote));
+    } catch (e) {
+        responderErroAnexo(res, e);
+    }
+});
+
+app.delete('/anexos/:lote', async (req, res) => {
+    if (!anexosApi) return res.status(501).json({ erro: 'Modulo de anexos indisponivel no servidor.' });
+    try {
+        res.json(await anexosApi.limpar(req.params.lote));
+    } catch (e) {
+        responderErroAnexo(res, e);
+    }
 });
 
 // Endpoint simples para verificar se o servico esta no ar
