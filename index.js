@@ -741,7 +741,7 @@ async function processarJob(jobId, parametros) {
 
     } catch (error) {
         log(jobId, '===== ERRO FATAL =====');
-        console.error('🚨 Erro no job ' + jobId + ':', error);
+        console.error('ðŸš¨ Erro no job ' + jobId + ':', error);
         await gravarStatus(jobId, {
             status: 'ERRO',
             etapa: 'Falhou',
@@ -776,7 +776,7 @@ async function processarJob(jobId, parametros) {
 // =========================================================================
 app.post('/gerar-pdf', async (req, res) => {
     if (!req.body || typeof req.body.html !== 'string' || req.body.html.trim() === '') {
-        return res.status(400).json({ erro: "O campo 'html' é obrigatório e deve ser um texto não vazio." });
+        return res.status(400).json({ erro: "O campo 'html' Ã© obrigatÃ³rio e deve ser um texto nÃ£o vazio." });
     }
 
     const jobId = crypto.randomUUID();
