@@ -15,6 +15,14 @@ try {
     console.warn('Otimizador de fotos indisponivel (' + e.message + '). Seguindo sem otimizar.');
 }
 
+// Capa isolada (opcional): se o arquivo capa.js nao existir, o servidor
+// continua funcionando exatamente como antes (sem capa isolada).
+let capaApi = null;
+try {
+    capaApi = require('./capa');
+} catch (e) {
+    console.warn('Modulo de capa indisponivel (' + e.message + '). Seguindo sem capa isolada.');
+}
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
@@ -323,7 +331,9 @@ async function renderizarDocumento(jobId, browser, htmlContent, blocoGeometria, 
 // Uma unica leitura (pdfParse), um load e um save, com as duas correcoes
 // aplicadas no mesmo documento em memoria.
 // =========================================================================
-async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corrigirRodape) {
+async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corrigirRodape, paginasCapa) {
+    // paginasCapa: quantas paginas iniciais sao a capa isolada (nao entram na renumeracao do rodape)
+    paginasCapa = paginasCapa || 0;
     const pagesItems = [];
 
     function custom_render_page(pageData) {
@@ -357,7 +367,7 @@ async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corri
         const totalPaginas = pdfDoc.getPageCount();
         let corrigidas = 0;
 
-        for (let i = 0; i < pagesItems.length && i < pages.length; i++) {
+        for (let i = paginasCapa; i < pagesItems.length && i < pages.length; i++) {
             const items = pagesItems[i];
             const idxMarcador = items.findIndex(function (it) { return /FOLHA\s*:?/i.test(it.str); });
             if (idxMarcador === -1) continue;
@@ -552,6 +562,15 @@ async function processarJob(jobId, parametros) {
             }
         }
 
+        // CAPA ISOLADA: tira a capa do HTML (se vier entre <!--CAPA_START--> e <!--CAPA_END-->).
+        // Sem os marcadores, nada muda para os demais capitulos.
+        const capa = capaApi ? capaApi.extrairCapa(htmlContent) : { capaHtml: '', htmlSemCapa: htmlContent };
+        htmlContent = capa.htmlSemCapa;
+        const temCapa = capa.capaHtml.length > 0;
+        if (temCapa) {
+            log(jobId, 'Capa isolada detectada (' + (capa.capaHtml.length / 1024).toFixed(0) + ' KB)');
+        }
+
         const headerRaw = parametros.cabecalho || '<div></div>';
         const footerRaw = parametros.rodape || '<div></div>';
         const mTop = parametros.margemTop || '10mm';
@@ -640,7 +659,9 @@ async function processarJob(jobId, parametros) {
                 log(jobId, 'Mapeando ' + uniqueAnchors.length + ' ancora(s) unica(s)...');
                 uniqueAnchors.forEach(function (anchor) {
                     const pureAnchor = normalizarAncora(anchor);
-                    const pageNum = pagesNormalizadas.findIndex(function (pText) { return pText.includes(pureAnchor); }) + 1;
+                    let pageNum = pagesNormalizadas.findIndex(function (pText) { return pText.includes(pureAnchor); }) + 1;
+                    // Com capa isolada, todas as paginas do corpo andam uma folha para frente
+                    if (pageNum > 0 && temCapa) pageNum += capaApi.CAPA_PAGINAS;
                     const placeholder = anchor.replace('#ANC_', '{{PAG_').replace('#', '}}');
                     const codigo = anchor.replace(/^#ANC_/, '').replace(/#$/, '');
 
@@ -678,19 +699,28 @@ async function processarJob(jobId, parametros) {
         let finalPdfBuffer = resultadoFinal.buffer;
         log(jobId, 'ETAPA 3/4 - PDF final pronto (' + (finalPdfBuffer.length / 1024 / 1024).toFixed(1) + ' MB)');
 
+        // CAPA ISOLADA: renderiza a capa (sem cabecalho/rodape/margem) e coloca na frente do corpo
+        if (temCapa) {
+            const totalFolhas = (await capaApi.contarPaginas(finalPdfBuffer)) + capaApi.CAPA_PAGINAS;
+            log(jobId, 'Renderizando a capa isolada (folha 1 de ' + totalFolhas + ')...');
+            const capaBuffer = await capaApi.renderizarCapa(browser, capa.capaHtml, totalFolhas);
+            finalPdfBuffer = await capaApi.anexarCapa(finalPdfBuffer, capaBuffer);
+            log(jobId, 'Capa anexada ao PDF');
+        }
+
         log(jobId, 'Fechando navegador (nao e mais necessario)...');
         await browser.close();
         browser = null;
         liberarMemoria();
 
-        const precisaRodape = resultadoFinal.temSegmentosPaisagem;
+        const precisaRodape = resultadoFinal.temSegmentosPaisagem || temCapa;
         const precisaIndice = Object.keys(mapaDestinos).length > 0;
 
         if (precisaRodape || precisaIndice) {
             await gravarStatus(jobId, { status: 'PROCESSANDO', etapa: 'Ajustando indice e numeracao (4/4)' });
             log(jobId, 'ETAPA 4/4 - Pos-processamento (rodape + indice em uma unica passagem)...');
             const mLateralPt = mmParaPt(mLateral);
-            finalPdfBuffer = await posProcessarPDF(jobId, finalPdfBuffer, precisaIndice ? mapaDestinos : null, mLateralPt, precisaRodape);
+            finalPdfBuffer = await posProcessarPDF(jobId, finalPdfBuffer, precisaIndice ? mapaDestinos : null, mLateralPt, precisaRodape, temCapa ? capaApi.CAPA_PAGINAS : 0);
             log(jobId, 'ETAPA 4/4 - Pos-processamento concluido');
         } else {
             log(jobId, 'ETAPA 4/4 - Pulada (nada a corrigir)');
