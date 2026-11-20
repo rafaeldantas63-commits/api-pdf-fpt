@@ -346,11 +346,13 @@ async function renderizarDocumento(jobId, browser, htmlContent, blocoGeometria, 
 // Uma unica leitura (pdfParse), um load e um save, com as duas correcoes
 // aplicadas no mesmo documento em memoria.
 // =========================================================================
-async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corrigirRodape, paginasCapa, paginasExtras) {
+async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corrigirRodape, paginasCapa, paginasExtras, folhaNoTopo) {
     // paginasCapa: quantas paginas iniciais sao a capa isolada (nao entram na renumeracao do rodape)
     paginasCapa = paginasCapa || 0;
     // paginasExtras: paginas que serao coladas DEPOIS (anexos) e ja contam no total "FOLHA: x de N"
     paginasExtras = paginasExtras || 0;
+    // folhaNoTopo: o cabecalho do template traz o "FOLHA: x de N" (template Axia). A numeracao e feita na PARTE 1B, nao na PARTE 1
+    folhaNoTopo = !!folhaNoTopo;
     const pagesItems = [];
 
     function custom_render_page(pageData) {
@@ -380,7 +382,7 @@ async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corri
     // ---------------------------------------------------------------
     // PARTE 1 - NUMERACAO DO RODAPE ("FOLHA: X de Y")
     // ---------------------------------------------------------------
-    if (corrigirRodape) {
+    if (corrigirRodape && !folhaNoTopo) {
         const totalPaginas = pdfDoc.getPageCount() + paginasExtras;
         let corrigidas = 0;
 
@@ -413,6 +415,43 @@ async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corri
             corrigidas++;
         }
         log(jobId, '    rodape corrigido em ' + corrigidas + ' pagina(s)');
+    }
+
+    // ---------------------------------------------------------------
+    // PARTE 1B - NUMERACAO "FOLHA: X de Y" QUANDO ELA FICA NO CABECALHO (template Axia)
+    // So roda quando o cabecalho do template traz data-folha="topo" (folhaNoTopo). Os demais templates seguem na PARTE 1 acima.
+    // Desenha os dois NUMEROS (pagina e total) no lugar dos que o Chromium imprimiu em branco no cabecalho: nada e apagado nem coberto,
+    // entao o rotulo, as divisorias, o titulo e o corpo da pagina nao sao tocados.
+    // ---------------------------------------------------------------
+    if (corrigirRodape && folhaNoTopo) {
+        const totalPaginas = pdfDoc.getPageCount() + paginasExtras;
+        let corrigidas = 0;
+        for (let i = paginasCapa; i < pagesItems.length && i < pages.length; i++) {
+            const items = pagesItems[i];
+            const alturaPagina = pages[i].getHeight();
+            // O rotulo e o item cujo texto e exatamente "FOLHA:" nos 70 mm de cima da pagina:
+            // nao confunde com o titulo, o tipo do documento ("FOLHA DE DADOS") nem com a palavra "folha" no corpo.
+            let rotulo = null;
+            items.forEach(function (it) {
+                if (/^\s*FOLHA\s*:?\s*$/i.test(it.str) && it.y > alturaPagina - 198 && (rotulo === null || it.y > rotulo.y)) rotulo = it;
+            });
+            if (rotulo === null) continue;
+            const numeros = items.filter(function (it) {
+                return /^\s*\d+\s*$/.test(it.str) && Math.abs(it.y - rotulo.y) < 12 && it.x > rotulo.x;
+            }).sort(function (a, b) { return a.x - b.x; });
+            if (numeros.length < 2) continue;
+            const trocas = [
+                { item: numeros[0], texto: String(i + 1), centralizar: true },
+                { item: numeros[numeros.length - 1], texto: String(totalPaginas), centralizar: false }
+            ];
+            trocas.forEach(function (t) {
+                const tam = t.item.fontHeight || 10;
+                const larguraNova = fonteNormal.widthOfTextAtSize(t.texto, tam);
+                pages[i].drawText(t.texto, { x: t.centralizar ? t.item.x + (t.item.width - larguraNova) / 2 : t.item.x, y: t.item.y, size: tam, font: fonteNormal, color: rgb(0, 0, 0) });
+            });
+            corrigidas++;
+        }
+        log(jobId, '    folha no cabecalho corrigida em ' + corrigidas + ' pagina(s)');
     }
 
     // ---------------------------------------------------------------
@@ -626,6 +665,8 @@ async function processarJob(jobId, parametros) {
         const headerHtml = headerRaw.split('[MARGEM_LATERAL]').join(mLateral);
         const footerHtml = footerRaw.split('[MARGEM_LATERAL]').join(mLateral);
         const ehTemplateSiemens = cabecalhoEstaVazio(headerHtml);
+        // Template Axia: o cabecalho tem o "FOLHA: x de N" no topo (marcador data-folha="topo"); a numeracao e desenhada na PARTE 1B
+        const folhaNoTopo = /data-folha\s*=\s*["']topo["']/.test(headerHtml);
 
         let blocoGeometria = '<style id="geometria-pagina-api">';
         blocoGeometria += '@page { size: ' + tamanhoPapel + ' portrait; margin: ' + mTop + ' ' + mLateral + ' ' + mBottom + ' ' + mLateral + '; }';
@@ -782,14 +823,15 @@ async function processarJob(jobId, parametros) {
         browser = null;
         liberarMemoria();
 
-        const precisaRodape = resultadoFinal.temSegmentosPaisagem || temCapa || temAnexos;
+        // Com a folha no cabecalho (Axia) o pos-processamento sempre roda: os numeros do Chromium saem em branco e sao desenhados na PARTE 1B
+        const precisaRodape = resultadoFinal.temSegmentosPaisagem || temCapa || temAnexos || folhaNoTopo;
         const precisaIndice = Object.keys(mapaDestinos).length > 0;
 
         if (precisaRodape || precisaIndice) {
             await gravarStatus(jobId, { status: 'PROCESSANDO', etapa: 'Ajustando indice e numeracao (4/4)' });
             log(jobId, 'ETAPA 4/4 - Pos-processamento (rodape + indice em uma unica passagem)...');
             const mLateralPt = mmParaPt(mLateral);
-            finalPdfBuffer = await posProcessarPDF(jobId, finalPdfBuffer, precisaIndice ? mapaDestinos : null, mLateralPt, precisaRodape, temCapa ? capaApi.CAPA_PAGINAS : 0, paginasAnexos);
+            finalPdfBuffer = await posProcessarPDF(jobId, finalPdfBuffer, precisaIndice ? mapaDestinos : null, mLateralPt, precisaRodape, temCapa ? capaApi.CAPA_PAGINAS : 0, paginasAnexos, folhaNoTopo);
             log(jobId, 'ETAPA 4/4 - Pos-processamento concluido');
         } else {
             log(jobId, 'ETAPA 4/4 - Pulada (nada a corrigir)');
