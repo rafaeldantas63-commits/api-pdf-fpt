@@ -397,7 +397,10 @@ async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corri
 
     function custom_render_page(pageData) {
         return pageData.getTextContent().then(function (textContent) {
-            pagesItems.push(textContent.items.map(function (item) {
+            // Guarda pelo INDICE da pagina (e nao pela ordem de chegada): se o pdf-parse falhar numa pagina, ele engole o erro
+            // e segue; guardando pelo indice, as demais paginas continuam alinhadas com o PDF
+            const idxPagina = (typeof pageData.pageIndex === 'number') ? pageData.pageIndex : (typeof pageData.pageNumber === 'number' ? pageData.pageNumber - 1 : pagesItems.length);
+            pagesItems[idxPagina] = textContent.items.map(function (item) {
                 return {
                     str: item.str,
                     x: item.transform[4],
@@ -405,7 +408,7 @@ async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corri
                     width: item.width,
                     fontHeight: Math.hypot(item.transform[2], item.transform[3])
                 };
-            }));
+            });
             return '';
         });
     }
@@ -416,6 +419,14 @@ async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corri
     const pdfDoc = await PDFDocument.load(pdfBuffer);
     const pages = pdfDoc.getPages();
     const context = pdfDoc.context;
+    // Paginas cujo texto nao foi lido ficam com lista vazia (e sao avisadas no log), em vez de derrubar os laços abaixo
+    const paginasSemTexto = [];
+    for (let k = 0; k < pages.length; k++) {
+        if (!pagesItems[k]) { pagesItems[k] = []; paginasSemTexto.push(k + 1); }
+    }
+    if (paginasSemTexto.length > 0) {
+        log(jobId, '    AVISO: nao foi possivel ler o texto da(s) pagina(s) ' + paginasSemTexto.join(', ') + ' (o PDF tem ' + pages.length + '); a numeracao usa a posicao das demais paginas');
+    }
     const fonteNormal = await pdfDoc.embedFont(StandardFonts.Helvetica);
     const fonteBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
 
@@ -466,8 +477,11 @@ async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corri
     if (corrigirRodape && folhaNoTopo) {
         const totalPaginas = pdfDoc.getPageCount() + paginasExtras;
         let corrigidas = 0;
-        for (let i = paginasCapa; i < pagesItems.length && i < pages.length; i++) {
-            const items = pagesItems[i];
+        // 1) Acha, em cada pagina, onde o Chromium imprimiu o numero da folha e o total
+        const deteccoes = [];
+        const geometrias = {};   // posicao por formato de folha (retrato/paisagem): o cabecalho e igual em todas as paginas do mesmo formato
+        for (let i = paginasCapa; i < pages.length; i++) {
+            const items = pagesItems[i] || [];
             const alturaPagina = pages[i].getHeight();
             // O rotulo e o item cujo texto e exatamente "FOLHA:" nos 70 mm de cima da pagina:
             // nao confunde com o titulo, o tipo do documento ("FOLHA DE DADOS") nem com a palavra "folha" no corpo.
@@ -480,18 +494,32 @@ async function posProcessarPDF(jobId, pdfBuffer, mapaDestinos, mLateralPt, corri
                 return /^\s*\d+\s*$/.test(it.str) && Math.abs(it.y - rotulo.y) < 12 && it.x > rotulo.x;
             }).sort(function (a, b) { return a.x - b.x; });
             if (numeros.length < 2) continue;
-            const trocas = [
-                { item: numeros[0], texto: String(i + 1), centralizar: true },
-                { item: numeros[numeros.length - 1], texto: String(totalPaginas), centralizar: false }
-            ];
-            trocas.forEach(function (t) {
-                const tam = t.item.fontHeight || 10;
-                const larguraNova = fonteNormal.widthOfTextAtSize(t.texto, tam);
-                pages[i].drawText(t.texto, { x: t.centralizar ? t.item.x + (t.item.width - larguraNova) / 2 : t.item.x, y: t.item.y, size: tam, font: fonteNormal, color: rgb(0, 0, 0) });
-            });
+            const nPag = numeros[0];
+            const nTot = numeros[numeros.length - 1];
+            const g = {
+                cx: nPag.x + nPag.width / 2, y1: nPag.y, tam1: nPag.fontHeight || 10,
+                x2: nTot.x, y2: nTot.y, tam2: nTot.fontHeight || 10
+            };
+            deteccoes[i] = g;
+            const chave = Math.round(pages[i].getWidth());
+            if (!geometrias[chave]) geometrias[chave] = g;
+        }
+        // 2) Desenha os numeros. Pagina cuja posicao nao foi lida (ex.: o pdf-parse falhou nela) usa a posicao de outra pagina do MESMO formato
+        const usouReserva = [];
+        const semPosicao = [];
+        for (let i = paginasCapa; i < pages.length; i++) {
+            const g = deteccoes[i] || geometrias[Math.round(pages[i].getWidth())];
+            if (!g) { semPosicao.push(i + 1); continue; }
+            if (!deteccoes[i]) usouReserva.push(i + 1);
+            const textoPag = String(i + 1);
+            const textoTot = String(totalPaginas);
+            pages[i].drawText(textoPag, { x: g.cx - fonteNormal.widthOfTextAtSize(textoPag, g.tam1) / 2, y: g.y1, size: g.tam1, font: fonteNormal, color: rgb(0, 0, 0) });
+            pages[i].drawText(textoTot, { x: g.x2, y: g.y2, size: g.tam2, font: fonteNormal, color: rgb(0, 0, 0) });
             corrigidas++;
         }
         log(jobId, '    folha no cabecalho corrigida em ' + corrigidas + ' pagina(s)');
+        if (usouReserva.length > 0) log(jobId, '    folha no cabecalho: pagina(s) ' + usouReserva.join(', ') + ' com a posicao copiada de outra pagina do mesmo formato');
+        if (semPosicao.length > 0) log(jobId, '    AVISO: folha no cabecalho NAO numerada na(s) pagina(s) ' + semPosicao.join(', '));
     }
 
     // ---------------------------------------------------------------
@@ -729,10 +757,19 @@ async function processarJob(jobId, parametros) {
         if (headerPaisagem !== headerHtml || footerPaisagem !== footerHtml) {
             log(jobId, 'Paisagem: cabecalho/rodape do template esticados em +' + acrescimoPaisagemMm + ' mm');
         }
+        // Paisagem: o rodape comeca exatamente onde a area do corpo termina, entao a ultima linha da tabela ficava a ~1 mm da caixa do
+        // rodape. Aumenta a margem inferior em FOLGA_RODAPE_PAISAGEM_MM e empurra o conteudo do rodape para baixo na mesma medida:
+        // o rodape fica onde estava e o corpo termina mais acima.
+        const FOLGA_RODAPE_PAISAGEM_MM = 5;
+        const mBottomNumero = /^\s*[\d.]+\s*mm\s*$/i.test(mBottom) ? parseFloat(mBottom) : null;
+        const mBottomPaisagem = mBottomNumero !== null ? (mBottomNumero + FOLGA_RODAPE_PAISAGEM_MM) + 'mm' : mBottom;
+        const footerPaisagemFolga = mBottomNumero !== null
+            ? '<div style="padding-top:' + FOLGA_RODAPE_PAISAGEM_MM + 'mm;box-sizing:border-box;width:100%;">' + footerPaisagem + '</div>'
+            : footerPaisagem;
         const pdfOptionsPaisagem = {
             format: tamanhoPapel, landscape: true, printBackground: true, displayHeaderFooter: true,
-            headerTemplate: headerPaisagem, footerTemplate: footerPaisagem,
-            margin: { top: mTop, bottom: mBottom, right: mLateral, left: mLateral },
+            headerTemplate: headerPaisagem, footerTemplate: footerPaisagemFolga,
+            margin: { top: mTop, bottom: mBottomPaisagem, right: mLateral, left: mLateral },
             timeout: 120000
         };
 
