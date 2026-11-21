@@ -244,6 +244,46 @@ function cabecalhoEstaVazio(headerHtmlProcessado) {
     return semEspacos === '<div></div>' || semEspacos === '';
 }
 
+// =========================================================================
+// PAISAGEM - ESTICA O CABECALHO E O RODAPE DO TEMPLATE PARA A LARGURA DA FOLHA EM PAISAGEM
+//
+// Os templates (ex.: Axia) desenham o cabecalho e o rodape com tabelas de largura FIXA em mm,
+// medidas para a folha em retrato (A4: 190,83 mm no cabecalho e 193,07 mm no rodape). Em paisagem a
+// folha fica mais larga e o cabecalho/rodape sobrava ocupando so ~2/3 da largura.
+//
+// Aqui cada tabela com "width:XXmm" no style ganha o ACRESCIMO da folha (largura da paisagem menos a
+// largura do retrato: A4 = 297 - 210 = 87 mm). Assim as margens esquerda e direita continuam iguais as do
+// retrato e so o miolo cresce. As colunas (<col>) viram porcentagem da propria tabela, entao TODAS crescem
+// na mesma proporcao. Templates fluidos (width:100% / padding lateral, ex.: Siemens-Energy) nao tem
+// "width:XXmm" na tabela e passam sem alteracao. A numeracao "FOLHA: x de N" (PARTE 1B) procura a posicao
+// dos numeros no PDF, entao acompanha o cabecalho esticado sozinha.
+// =========================================================================
+const DIMENSOES_PAPEL_MM = { A3: [297, 420], A4: [210, 297], A5: [148, 210], LETTER: [215.9, 279.4], LEGAL: [215.9, 355.6] };
+
+function acrescimoLarguraPaisagemMm(tamanhoPapel) {
+    const dim = DIMENSOES_PAPEL_MM[String(tamanhoPapel || 'A4').toUpperCase()];
+    if (!dim) return 0;
+    return dim[1] - dim[0];
+}
+
+function esticarGabaritoParaPaisagem(html, acrescimoMm) {
+    if (!html || !(acrescimoMm > 0)) return html;
+    return html.replace(/<table\b([^>]*)>(\s*<colgroup>([\s\S]*?)<\/colgroup>)?/gi, function (trecho, atributos, grupoCompleto, colunas) {
+        const largura = atributos.match(/width\s*:\s*([\d.]+)mm/i);
+        if (!largura) return trecho;
+        const novaLargura = (parseFloat(largura[1]) + acrescimoMm).toFixed(2);
+        const novosAtributos = atributos.replace(/(width\s*:\s*)[\d.]+mm/i, function (m, prefixo) { return prefixo + novaLargura + 'mm'; });
+        if (!grupoCompleto) return '<table' + novosAtributos + '>';
+        let soma = 0;
+        colunas.replace(/<col\b[^>]*?width\s*:\s*([\d.]+)mm/gi, function (m, w) { soma += parseFloat(w); return m; });
+        if (!(soma > 0)) return '<table' + novosAtributos + '>' + grupoCompleto;
+        const novasColunas = colunas.replace(/(<col\b[^>]*?width\s*:\s*)([\d.]+)mm/gi, function (m, prefixo, w) {
+            return prefixo + (parseFloat(w) / soma * 100).toFixed(4) + '%';
+        });
+        return '<table' + novosAtributos + '>' + grupoCompleto.split(colunas).join(novasColunas);
+    });
+}
+
 // Conta as paginas de um PDF (usado para conferir se o corpo mudou de tamanho entre a passagem de calculo e a final)
 async function contarPaginasPdf(pdfBuffer) {
     const doc = await PDFDocument.load(pdfBuffer);
@@ -682,9 +722,16 @@ async function processarJob(jobId, parametros) {
             margin: { top: mTop, bottom: mBottom, right: mLateral, left: mLateral },
             preferCSSPageSize: true, timeout: 120000
         };
+        // Paisagem: cabecalho e rodape do template esticados para a largura da folha (ver esticarGabaritoParaPaisagem)
+        const acrescimoPaisagemMm = acrescimoLarguraPaisagemMm(tamanhoPapel);
+        const headerPaisagem = esticarGabaritoParaPaisagem(headerHtml, acrescimoPaisagemMm);
+        const footerPaisagem = esticarGabaritoParaPaisagem(footerHtml, acrescimoPaisagemMm);
+        if (headerPaisagem !== headerHtml || footerPaisagem !== footerHtml) {
+            log(jobId, 'Paisagem: cabecalho/rodape do template esticados em +' + acrescimoPaisagemMm + ' mm');
+        }
         const pdfOptionsPaisagem = {
             format: tamanhoPapel, landscape: true, printBackground: true, displayHeaderFooter: true,
-            headerTemplate: headerHtml, footerTemplate: footerHtml,
+            headerTemplate: headerPaisagem, footerTemplate: footerPaisagem,
             margin: { top: mTop, bottom: mBottom, right: mLateral, left: mLateral },
             timeout: 120000
         };
